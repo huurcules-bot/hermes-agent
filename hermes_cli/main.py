@@ -5610,13 +5610,14 @@ def _ensure_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
 
 
 def _sync_fork_main_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
-    """Keep origin/main as a strict mirror of upstream/main.
+    """Keep fork commits rebased on top of upstream/main.
 
-    Strategy: fetch upstream, then push upstream/main directly to
-    origin/main so the fork's main never diverges from
-    NousResearch/hermes-agent:main.  Feature branches on origin are not
-    touched.  Returns True if origin/main is in sync with upstream/main
-    after this call.
+    Strategy: fetch upstream, identify commits that are on origin/main but
+    not on upstream/main (the fork's custom commits), rebase them onto
+    upstream/main, and force-push.  This keeps the fork's main as
+    upstream/main + custom commits on top — no merge commits ever.
+
+    Returns True if origin/main is in sync after this call.
     """
     print("→ Fetching upstream (NousResearch/hermes-agent)...")
     fetch = subprocess.run(
@@ -5629,6 +5630,14 @@ def _sync_fork_main_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
         print("  ✗ Failed to fetch upstream. origin/main may be stale.")
         return False
 
+    # Also fetch origin to ensure origin/main is up to date
+    subprocess.run(
+        git_cmd + ["fetch", "origin", "--quiet"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+
     upstream_ahead = _count_commits_between(git_cmd, cwd, "origin/main", "upstream/main")
     origin_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "origin/main")
 
@@ -5640,36 +5649,202 @@ def _sync_fork_main_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
         print("  ✓ Fork main is already in sync with upstream")
         return True
 
-    if origin_ahead > 0:
-        print(f"  ⚠ Fork main is {origin_ahead} commit(s) ahead of upstream — resetting to upstream")
+    if upstream_ahead == 0:
+        # Origin has custom commits but upstream hasn't moved — nothing to rebase
+        print(f"  ✓ Fork main has {origin_ahead} custom commit(s) on top of upstream (up to date)")
+        return True
 
-    if upstream_ahead > 0:
-        print(f"  → Upstream is {upstream_ahead} commit(s) ahead — syncing fork main...")
+    if origin_ahead == 0:
+        # No custom commits — fast-forward origin/main to upstream/main
+        print(f"  → Upstream is {upstream_ahead} commit(s) ahead — fast-forwarding fork main...")
+        push = subprocess.run(
+            git_cmd + ["push", "origin", "upstream/main:refs/heads/main", "--force-with-lease"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        if push.returncode == 0:
+            print("  ✓ Fork main synced with upstream")
+            return True
+        # Fallback to --force
+        push2 = subprocess.run(
+            git_cmd + ["push", "origin", "upstream/main:refs/heads/main", "--force"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        if push2.returncode == 0:
+            print("  ✓ Fork main synced with upstream")
+            return True
+        print(f"  ✗ Could not sync fork main: {push2.stderr.strip()}")
+        return False
 
-    # Push upstream/main directly to origin/main (refspec form avoids checkout)
+    # Both sides have commits — rebase fork's custom commits onto upstream/main
+    print(f"  → Upstream is {upstream_ahead} commit(s) ahead, fork has {origin_ahead} custom commit(s)")
+    print(f"  → Rebasing {origin_ahead} fork commit(s) onto upstream/main...")
+
+    # Save current branch and state
+    current_branch_result = subprocess.run(
+        git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    current_branch = current_branch_result.stdout.strip() if current_branch_result.returncode == 0 else ""
+    was_on_main = current_branch == "main"
+
+    # Stash any uncommitted changes before rebase
+    had_stash = False
+    stash_check = subprocess.run(
+        git_cmd + ["status", "--porcelain"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if stash_check.returncode == 0 and stash_check.stdout.strip():
+        stash_result = subprocess.run(
+            git_cmd + ["stash", "push", "-m", "hermes-update-fork-sync"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        had_stash = stash_result.returncode == 0
+
+    # Ensure we're on main for the rebase
+    if not was_on_main:
+        checkout = subprocess.run(
+            git_cmd + ["checkout", "main"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        if checkout.returncode != 0:
+            print(f"  ✗ Could not checkout main: {checkout.stderr.strip()}")
+            if had_stash:
+                subprocess.run(git_cmd + ["stash", "pop"], cwd=cwd, capture_output=True, text=True)
+            return False
+
+    # Make sure local main matches origin/main before rebasing
+    subprocess.run(
+        git_cmd + ["reset", "--hard", "origin/main"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+
+    # Rebase: replay fork commits on top of upstream/main
+    rebase = subprocess.run(
+        git_cmd + ["rebase", "upstream/main"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if rebase.returncode != 0:
+        # Rebase conflict — abort and fall back to cherry-pick strategy
+        print("  ⚠ Rebase conflict — aborting rebase and trying cherry-pick...")
+        subprocess.run(
+            git_cmd + ["rebase", "--abort"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        # Reset to upstream/main and cherry-pick each fork commit
+        subprocess.run(
+            git_cmd + ["reset", "--hard", "upstream/main"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        # Get the fork commit SHAs (oldest first) from origin/main
+        commits_result = subprocess.run(
+            git_cmd + ["log", "--reverse", "--format=%H", "upstream/main..origin/main"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        if commits_result.returncode != 0 or not commits_result.stdout.strip():
+            print("  ✗ Could not identify fork commits for cherry-pick. Resetting to upstream.")
+            # Push upstream/main as-is (drops fork commits)
+            subprocess.run(
+                git_cmd + ["push", "origin", "upstream/main:refs/heads/main", "--force"],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+            )
+            if had_stash:
+                subprocess.run(git_cmd + ["stash", "pop"], cwd=cwd, capture_output=True, text=True)
+            return False
+
+        commit_shas = commits_result.stdout.strip().split("\n")
+        failed_commits = []
+        for sha in commit_shas:
+            cp = subprocess.run(
+                git_cmd + ["cherry-pick", sha],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+            )
+            if cp.returncode != 0:
+                # Skip this commit (likely already applied or conflicts)
+                subprocess.run(
+                    git_cmd + ["cherry-pick", "--abort"],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                )
+                failed_commits.append(sha[:12])
+
+        if failed_commits:
+            print(f"  ⚠ Skipped conflicting commits: {', '.join(failed_commits)}")
+
+    # Force-push the rebased main to origin
     push = subprocess.run(
-        git_cmd + ["push", "origin", "upstream/main:refs/heads/main", "--force-with-lease"],
+        git_cmd + ["push", "origin", "main", "--force-with-lease"],
         cwd=cwd,
         capture_output=True,
         text=True,
     )
+    if push.returncode != 0:
+        push = subprocess.run(
+            git_cmd + ["push", "origin", "main", "--force"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+
     if push.returncode == 0:
-        print("  ✓ Fork main synced with upstream")
+        new_origin_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "HEAD")
+        if new_origin_ahead > 0:
+            print(f"  ✓ Fork main rebased: {new_origin_ahead} custom commit(s) on top of upstream")
+        else:
+            print("  ✓ Fork main synced with upstream")
+        # Restore stash
+        if had_stash:
+            subprocess.run(git_cmd + ["stash", "pop"], cwd=cwd, capture_output=True, text=True)
         return True
 
-    # force-with-lease rejected — origin has diverged. Force-reset as fallback.
-    print("  ⚠ force-with-lease rejected; force-pushing to reset fork main to upstream...")
-    push2 = subprocess.run(
-        git_cmd + ["push", "origin", "upstream/main:refs/heads/main", "--force"],
+    print(f"  ✗ Could not push rebased main: {push.stderr.strip()}")
+    # Try to recover local state
+    subprocess.run(
+        git_cmd + ["reset", "--hard", "origin/main"],
         cwd=cwd,
         capture_output=True,
         text=True,
     )
-    if push2.returncode == 0:
-        print("  ✓ Fork main force-reset to upstream")
-        return True
 
-    print(f"  ✗ Could not sync fork main: {push2.stderr.strip()}")
+    # Restore original branch if we switched
+    if not was_on_main and current_branch:
+        subprocess.run(
+            git_cmd + ["checkout", current_branch],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+
+    # Restore stash
+    if had_stash:
+        subprocess.run(git_cmd + ["stash", "pop"], cwd=cwd, capture_output=True, text=True)
+
     return False
 
 

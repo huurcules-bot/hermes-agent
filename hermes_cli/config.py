@@ -675,6 +675,9 @@ DEFAULT_CONFIG = {
         "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
         "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
+        "max_wall_seconds": 3600,  # per-subagent wall-clock timeout in seconds (0 = disabled).
+                                   # Subagent is interrupted if it runs longer than this, preventing
+                                   # the parent from blocking indefinitely on a stuck child.
         "reasoning_effort": "",  # reasoning effort for subagents: "xhigh", "high", "medium",
                                  # "low", "minimal", "none" (empty = inherit parent's level)
     },

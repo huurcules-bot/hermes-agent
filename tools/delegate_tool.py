@@ -429,6 +429,7 @@ def _run_single_child(
     goal: str,
     child=None,
     parent_agent=None,
+    max_wall_seconds: float = 0,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -495,6 +496,28 @@ def _run_single_child(
 
     _heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
     _heartbeat_thread.start()
+
+    # Wall-clock deadline: interrupt the child if it runs longer than
+    # max_wall_seconds.  This prevents a stuck subagent (hung tool, runaway
+    # loop, API freeze) from blocking the parent indefinitely.  The timer is
+    # cancelled in the finally block if the child finishes in time.
+    _wall_timer: Optional[threading.Timer] = None
+    if max_wall_seconds and max_wall_seconds > 0:
+        def _wall_timeout_fire():
+            logger.warning(
+                "[subagent-%d] wall-clock limit of %.0fs exceeded — interrupting",
+                task_index, max_wall_seconds,
+            )
+            interrupt_fn = getattr(child, "interrupt", None)
+            if callable(interrupt_fn):
+                try:
+                    interrupt_fn(f"Wall-clock deadline exceeded ({max_wall_seconds:.0f}s)")
+                except Exception as exc:
+                    logger.debug("[subagent-%d] interrupt() raised: %s", task_index, exc)
+
+        _wall_timer = threading.Timer(max_wall_seconds, _wall_timeout_fire)
+        _wall_timer.daemon = True
+        _wall_timer.start()
 
     try:
         if child_progress_cb:
@@ -635,6 +658,10 @@ def _run_single_child(
         }
 
     finally:
+        # Cancel the wall-clock deadline timer (no-op if already fired or not set).
+        if _wall_timer is not None:
+            _wall_timer.cancel()
+
         # Stop the heartbeat thread so it doesn't keep touching parent activity
         # after the child has finished (or failed).
         _heartbeat_stop.set()
@@ -713,6 +740,7 @@ def delegate_task(
     cfg = _load_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     effective_max_iter = max_iterations or default_max_iter
+    effective_max_wall = float(cfg.get("max_wall_seconds", 3600) or 0)
 
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
@@ -788,7 +816,8 @@ def delegate_task(
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
         _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
+        result = _run_single_child(0, _t["goal"], child, parent_agent,
+                                   max_wall_seconds=effective_max_wall)
         results.append(result)
     else:
         # Batch -- run in parallel with per-task progress lines
@@ -804,6 +833,7 @@ def delegate_task(
                     goal=t["goal"],
                     child=child,
                     parent_agent=parent_agent,
+                    max_wall_seconds=effective_max_wall,
                 )
                 futures[future] = i
 

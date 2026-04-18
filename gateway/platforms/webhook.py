@@ -344,6 +344,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # Parse payload
         try:
             payload = json.loads(raw_body)
+            logger.info("[webhook] Parsed JSON payload, top-level keys: %s", list(payload.keys())[:10])
         except json.JSONDecodeError:
             # Try form-encoded as fallback
             try:
@@ -352,6 +353,20 @@ class WebhookAdapter(BasePlatformAdapter):
                 payload = dict(
                     urllib.parse.parse_qsl(raw_body.decode("utf-8"))
                 )
+                # GitHub form-encoded webhooks wrap the real JSON
+                # payload under a single "payload" key — unwrap it.
+                if list(payload.keys()) == ["payload"]:
+                    try:
+                        payload = json.loads(payload["payload"])
+                        logger.info(
+                            "[webhook] Unwrapped form-encoded JSON payload, "
+                            "top-level keys: %s",
+                            list(payload.keys())[:10],
+                        )
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                else:
+                    logger.info("[webhook] Fell back to form-encoded, keys: %s", list(payload.keys())[:10])
             except Exception:
                 return web.json_response(
                     {"error": "Cannot parse body"}, status=400
@@ -527,6 +542,19 @@ class WebhookAdapter(BasePlatformAdapter):
             raw_message=payload,
             message_id=delivery_id,
         )
+
+        # ── Per-route model override ──────────────────────────────────
+        # Allow webhook subscriptions to specify a model that differs from
+        # the global default.  Seeds the gateway runner's session model
+        # override dict so _resolve_session_agent_runtime() picks it up.
+        route_model = route_config.get("model")
+        if route_model and self.gateway_runner:
+            from gateway.session import build_session_key as _bsk
+            _override_sk = _bsk(source)
+            self.gateway_runner._session_model_overrides[_override_sk] = {
+                "model": route_model,
+                "provider": route_config.get("model_provider"),
+            }
 
         logger.info(
             "[webhook] %s event=%s route=%s prompt_len=%d delivery=%s",

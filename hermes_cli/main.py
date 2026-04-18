@@ -5594,6 +5594,85 @@ def _mark_skip_upstream_prompt():
         pass
 
 
+def _ensure_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
+    """Add the official upstream remote silently if not already present.
+
+    Returns True if the upstream remote is now available.
+    """
+    if _has_upstream_remote(git_cmd, cwd):
+        return True
+    added = _add_upstream_remote(git_cmd, cwd)
+    if added:
+        print("  ✓ Added upstream: https://github.com/NousResearch/hermes-agent.git")
+    else:
+        print("  ✗ Failed to add upstream remote.")
+    return added
+
+
+def _sync_fork_main_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
+    """Keep origin/main as a strict mirror of upstream/main.
+
+    Strategy: fetch upstream, then push upstream/main directly to
+    origin/main so the fork's main never diverges from
+    NousResearch/hermes-agent:main.  Feature branches on origin are not
+    touched.  Returns True if origin/main is in sync with upstream/main
+    after this call.
+    """
+    print("→ Fetching upstream (NousResearch/hermes-agent)...")
+    fetch = subprocess.run(
+        git_cmd + ["fetch", "upstream", "--quiet"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if fetch.returncode != 0:
+        print("  ✗ Failed to fetch upstream. origin/main may be stale.")
+        return False
+
+    upstream_ahead = _count_commits_between(git_cmd, cwd, "origin/main", "upstream/main")
+    origin_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "origin/main")
+
+    if upstream_ahead < 0 or origin_ahead < 0:
+        print("  ✗ Could not compare upstream/main with origin/main. Skipping fork sync.")
+        return False
+
+    if upstream_ahead == 0 and origin_ahead == 0:
+        print("  ✓ Fork main is already in sync with upstream")
+        return True
+
+    if origin_ahead > 0:
+        print(f"  ⚠ Fork main is {origin_ahead} commit(s) ahead of upstream — resetting to upstream")
+
+    if upstream_ahead > 0:
+        print(f"  → Upstream is {upstream_ahead} commit(s) ahead — syncing fork main...")
+
+    # Push upstream/main directly to origin/main (refspec form avoids checkout)
+    push = subprocess.run(
+        git_cmd + ["push", "origin", "upstream/main:refs/heads/main", "--force-with-lease"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if push.returncode == 0:
+        print("  ✓ Fork main synced with upstream")
+        return True
+
+    # force-with-lease rejected — origin has diverged. Force-reset as fallback.
+    print("  ⚠ force-with-lease rejected; force-pushing to reset fork main to upstream...")
+    push2 = subprocess.run(
+        git_cmd + ["push", "origin", "upstream/main:refs/heads/main", "--force"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if push2.returncode == 0:
+        print("  ✓ Fork main force-reset to upstream")
+        return True
+
+    print(f"  ✗ Could not sync fork main: {push2.stderr.strip()}")
+    return False
+
+
 def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
     """Attempt to push updated main to origin (sync fork).
 
@@ -6355,6 +6434,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         print("⚠ Updating from fork:")
         print(f"  {origin_url}")
         print()
+        # Sync origin/main with upstream BEFORE fetching — so that when we
+        # pull from origin below, we're already pulling upstream's latest.
+        if _ensure_upstream_remote(git_cmd, PROJECT_ROOT):
+            _sync_fork_main_with_upstream(git_cmd, PROJECT_ROOT)
+        print()
 
     if use_zip_update:
         # ZIP-based update for Windows when git is broken
@@ -6535,9 +6619,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
             )
 
-        # Fork upstream sync logic (only for main branch on forks)
-        if is_fork and branch == "main":
-            _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
+        # Fork upstream sync is now done BEFORE the local pull (see above).
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
         # breaks on this machine, keep base deps and reinstall the remaining extras

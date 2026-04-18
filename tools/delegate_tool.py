@@ -1237,6 +1237,7 @@ def _run_single_child(
     goal: str,
     child=None,
     parent_agent=None,
+    max_wall_seconds: float = 0,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -1403,6 +1404,8 @@ def _run_single_child(
         # Run child with a hard timeout to prevent indefinite blocking
         # when the child's API call or tool-level HTTP request hangs.
         child_timeout = _get_child_timeout()
+        if max_wall_seconds and max_wall_seconds > 0:
+            child_timeout = max_wall_seconds  # per-call override takes precedence
         _timeout_executor = ThreadPoolExecutor(
             max_workers=1,
             # Install a non-interactive approval callback in the worker thread
@@ -1860,6 +1863,7 @@ def delegate_task(
             max_iterations, default_max_iter,
         )
     effective_max_iter = default_max_iter
+    effective_max_wall = 0.0  # default: no override; child_timeout_seconds from config applies
 
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
@@ -1955,7 +1959,8 @@ def delegate_task(
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
         _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
+        result = _run_single_child(0, _t["goal"], child, parent_agent,
+                                   max_wall_seconds=effective_max_wall)
         results.append(result)
     else:
         # Batch -- run in parallel with per-task progress lines
@@ -1971,6 +1976,7 @@ def delegate_task(
                     goal=t["goal"],
                     child=child,
                     parent_agent=parent_agent,
+                    max_wall_seconds=effective_max_wall,
                 )
                 futures[future] = i
 

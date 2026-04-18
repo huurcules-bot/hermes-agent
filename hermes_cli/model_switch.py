@@ -92,8 +92,8 @@ def _check_hermes_model_warning(model_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Model aliases -- short names -> (vendor, family) with NO version numbers.
-# Resolved dynamically against the live models.dev catalog.
+# Model aliases -- short names -> (vendor, family[, default]) resolved
+# dynamically against the live models.dev catalog.
 # ---------------------------------------------------------------------------
 
 class ModelIdentity(NamedTuple):

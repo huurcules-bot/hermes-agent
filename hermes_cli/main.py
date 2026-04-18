@@ -5771,6 +5771,13 @@ def _sync_fork_main_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
                 capture_output=True,
                 text=True,
             )
+            if not was_on_main and current_branch:
+                subprocess.run(
+                    git_cmd + ["checkout", current_branch],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                )
             if had_stash:
                 subprocess.run(git_cmd + ["stash", "pop"], cwd=cwd, capture_output=True, text=True)
             return False

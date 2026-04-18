@@ -100,13 +100,14 @@ class ModelIdentity(NamedTuple):
     """Vendor slug and family prefix used for catalog resolution."""
     vendor: str
     family: str
+    default: str = ""  # Exact model ID to prefer over arbitrary catalog ordering
 
 
 MODEL_ALIASES: dict[str, ModelIdentity] = {
     # Anthropic
-    "sonnet":    ModelIdentity("anthropic", "claude-sonnet"),
-    "opus":      ModelIdentity("anthropic", "claude-opus"),
-    "haiku":     ModelIdentity("anthropic", "claude-haiku"),
+    "sonnet":    ModelIdentity("anthropic", "claude-sonnet", "claude-sonnet-4-6"),
+    "opus":      ModelIdentity("anthropic", "claude-opus", "claude-opus-4-6"),
+    "haiku":     ModelIdentity("anthropic", "claude-haiku", "claude-haiku-4-5-20251001"),
     "claude":    ModelIdentity("anthropic", "claude"),
 
     # OpenAI
@@ -446,7 +447,7 @@ def resolve_alias(
     if identity is None:
         return None
 
-    vendor, family = identity
+    vendor, family, _default = identity
 
     # Build catalog from models.dev, then merge in static _PROVIDER_MODELS
     # entries that models.dev may be missing (e.g. newly added models not
@@ -463,7 +464,28 @@ def resolve_alias(
     except Exception:
         pass
 
-    # For aggregators, models are vendor/model-name format
+    catalog_set = {mid.lower() for mid in catalog}
+
+    # If the alias has a default model and it's in the catalog, use it directly.
+    # This avoids non-deterministic ordering in the catalog (e.g. "opus"
+    # matching claude-opus-4-5-20251101 before claude-opus-4-6).
+    if identity.default:
+        default_lower = identity.default.lower()
+        # For aggregators, also check vendor/default form
+        aggregator = is_aggregator(current_provider)
+        if aggregator:
+            agg_default = f"{vendor}/{identity.default}".lower()
+            if agg_default in catalog_set:
+                # Find the original-cased version
+                for mid in catalog:
+                    if mid.lower() == agg_default:
+                        return (current_provider, mid, key)
+        if default_lower in catalog_set:
+            for mid in catalog:
+                if mid.lower() == default_lower:
+                    return (current_provider, mid, key)
+
+    # Fallback: first catalog entry matching the family prefix
     aggregator = is_aggregator(current_provider)
 
     if aggregator:
@@ -863,21 +885,33 @@ def switch_model(
     new_model = normalize_model_for_provider(new_model, target_provider)
 
     # --- Validate ---
-    try:
-        validation = validate_requested_model(
-            new_model,
-            target_provider,
-            api_key=api_key,
-            base_url=base_url,
-            api_mode=api_mode or None,
-        )
-    except Exception as e:
+    # Skip live API validation for alias-resolved models — they were already
+    # found in the models.dev catalog.  Many providers (e.g. Anthropic) don't
+    # expose a /v1/models endpoint, so probing it returns None and the
+    # validation falls through to "Could not reach the API" false errors.
+    if resolved_alias:
         validation = {
-            "accepted": False,
-            "persist": False,
-            "recognized": False,
-            "message": f"Could not validate `{new_model}`: {e}",
+            "accepted": True,
+            "persist": True,
+            "recognized": True,
+            "message": None,
         }
+    else:
+        try:
+            validation = validate_requested_model(
+                new_model,
+                target_provider,
+                api_key=api_key,
+                base_url=base_url,
+                api_mode=api_mode or None,
+            )
+        except Exception as e:
+            validation = {
+                "accepted": False,
+                "persist": False,
+                "recognized": False,
+                "message": f"Could not validate `{new_model}`: {e}",
+            }
 
     # Override rejection if model is in the user's saved provider config.
     # API /v1/models may not list cloud/aliased models even though the server supports them.

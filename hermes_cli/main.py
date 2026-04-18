@@ -5805,8 +5805,18 @@ def _sync_fork_main_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
         text=True,
     )
     if push.returncode != 0:
+        # force-with-lease rejected — someone pushed to origin/main since our
+        # fetch.  Re-fetch and retry once rather than using bare --force which
+        # would silently overwrite their work.
+        print("  ⚠ force-with-lease rejected — re-fetching and retrying...")
+        subprocess.run(
+            git_cmd + ["fetch", "origin", "--quiet"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
         push = subprocess.run(
-            git_cmd + ["push", "origin", "main", "--force"],
+            git_cmd + ["push", "origin", "main", "--force-with-lease"],
             cwd=cwd,
             capture_output=True,
             text=True,
@@ -5818,6 +5828,14 @@ def _sync_fork_main_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
             print(f"  ✓ Fork main rebased: {new_origin_ahead} custom commit(s) on top of upstream")
         else:
             print("  ✓ Fork main synced with upstream")
+        # Restore original branch if we switched
+        if not was_on_main and current_branch:
+            subprocess.run(
+                git_cmd + ["checkout", current_branch],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+            )
         # Restore stash
         if had_stash:
             subprocess.run(git_cmd + ["stash", "pop"], cwd=cwd, capture_output=True, text=True)

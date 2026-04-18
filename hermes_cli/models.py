@@ -2998,6 +2998,35 @@ def validate_requested_model(
         except Exception:
             pass  # Fall through to generic warning
 
+    # Fallback: check the models.dev catalog before giving up.
+    # Many providers (e.g. Anthropic) don't expose a /v1/models endpoint,
+    # so the live API probe always returns None for them.  The models.dev
+    # catalog is fetched once and cached (1 hr TTL), so this is free.
+    try:
+        from agent.models_dev import list_provider_models
+        catalog_models = list_provider_models(normalized)
+        if catalog_models:
+            catalog_set = {m.lower() for m in catalog_models}
+            if requested.lower() in catalog_set:
+                return {
+                    "accepted": True,
+                    "persist": True,
+                    "recognized": True,
+                    "message": None,
+                }
+            # Auto-correct against catalog
+            auto = get_close_matches(requested, catalog_models, n=1, cutoff=0.9)
+            if auto:
+                return {
+                    "accepted": True,
+                    "persist": True,
+                    "recognized": True,
+                    "corrected_model": auto[0],
+                    "message": f"Auto-corrected `{requested}` → `{auto[0]}`",
+                }
+    except Exception:
+        pass
+
     # Static-catalog fallback: when the /models probe was unreachable,
     # validate against the curated list from provider_model_ids() — same
     # pattern as the openai-codex and minimax branches above.  This fixes

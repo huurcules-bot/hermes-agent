@@ -710,6 +710,7 @@ def delegate_task(
     toolsets: Optional[List[str]] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
+    max_wall_seconds: Optional[float] = None,
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     parent_agent=None,
@@ -740,7 +741,8 @@ def delegate_task(
     cfg = _load_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     effective_max_iter = max_iterations or default_max_iter
-    effective_max_wall = float(cfg.get("max_wall_seconds", 3600) or 0)
+    _configured_wall = float(cfg.get("max_wall_seconds", 600) or 0)
+    effective_max_wall = float(max_wall_seconds) if max_wall_seconds else _configured_wall
 
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
@@ -814,11 +816,64 @@ def delegate_task(
         _model_tools._last_resolved_tool_names = _parent_tool_names
 
     if n_tasks == 1:
-        # Single task -- run directly (no thread pool overhead)
+        # Single task -- run in a thread so the poll loop below can check for
+        # parent interrupts every 0.5 s.  Without this, a stuck child blocks
+        # the parent thread forever and _interrupt_requested is never checked.
         _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent,
-                                   max_wall_seconds=effective_max_wall)
-        results.append(result)
+        from concurrent.futures import wait as _cf_wait, FIRST_COMPLETED
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                _run_single_child,
+                task_index=0,
+                goal=_t["goal"],
+                child=child,
+                parent_agent=parent_agent,
+                max_wall_seconds=effective_max_wall,
+            )
+            pending = {future}
+            while pending:
+                if getattr(parent_agent, "_interrupt_requested", False) is True:
+                    # Parent interrupted — collect whatever the child produced
+                    # (if it already finished) or mark it as interrupted.
+                    for f in pending:
+                        if f.done():
+                            try:
+                                entry = f.result()
+                            except Exception as exc:
+                                entry = {
+                                    "task_index": 0,
+                                    "status": "error",
+                                    "summary": None,
+                                    "error": str(exc),
+                                    "api_calls": 0,
+                                    "duration_seconds": 0,
+                                }
+                        else:
+                            entry = {
+                                "task_index": 0,
+                                "status": "interrupted",
+                                "summary": None,
+                                "error": "Parent agent interrupted — child did not finish in time",
+                                "api_calls": 0,
+                                "duration_seconds": 0,
+                            }
+                        results.append(entry)
+                    break
+
+                done, pending = _cf_wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+                for f in done:
+                    try:
+                        entry = f.result()
+                    except Exception as exc:
+                        entry = {
+                            "task_index": 0,
+                            "status": "error",
+                            "summary": None,
+                            "error": str(exc),
+                            "api_calls": 0,
+                            "duration_seconds": 0,
+                        }
+                    results.append(entry)
     else:
         # Batch -- run in parallel with per-task progress lines
         completed_count = 0
@@ -1186,6 +1241,15 @@ DELEGATE_TASK_SCHEMA = {
                     "Only set lower for simple tasks."
                 ),
             },
+            "max_wall_seconds": {
+                "type": "integer",
+                "description": (
+                    "Maximum wall-clock seconds for the delegation. "
+                    "Overrides the global delegation.max_wall_seconds config. "
+                    "Default: 600 (10 minutes)."
+                ),
+                "minimum": 30,
+            },
             "acp_command": {
                 "type": "string",
                 "description": (
@@ -1222,6 +1286,7 @@ registry.register(
         toolsets=args.get("toolsets"),
         tasks=args.get("tasks"),
         max_iterations=args.get("max_iterations"),
+        max_wall_seconds=args.get("max_wall_seconds"),
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         parent_agent=kw.get("parent_agent")),

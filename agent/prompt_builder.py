@@ -148,24 +148,35 @@ HERMES_AGENT_HELP_GUIDANCE = (
 )
 
 MEMORY_GUIDANCE = (
-    "You have persistent memory across sessions. Save durable facts using the memory "
-    "tool: user preferences, environment details, tool quirks, and stable conventions. "
-    "Memory is injected into every turn, so keep it compact and focused on facts that "
-    "will still matter later.\n"
-    "Prioritize what reduces future user steering — the most valuable memory is one "
-    "that prevents the user from having to correct or remind you again. "
-    "User preferences and recurring corrections matter more than procedural task details.\n"
-    "Do NOT save task progress, session outcomes, completed-work logs, or temporary TODO "
-    "state to memory; use session_search to recall those from past transcripts. "
-    "If you've discovered a new way to do something, solved a problem that could be "
-    "necessary later, save it as a skill with the skill tool.\n"
-    "Write memories as declarative facts, not instructions to yourself. "
-    "'User prefers concise responses' ✓ — 'Always respond concisely' ✗. "
-    "'Project uses pytest with xdist' ✓ — 'Run tests with pytest -n 4' ✗. "
-    "Imperative phrasing gets re-read as a directive in later sessions and can "
-    "cause repeated work or override the user's current request. Procedures and "
-    "workflows belong in skills, not memory."
+    "You have persistent memory across sessions via two files: "
+    "MEMORY.md (technical facts) and USER.md (personal user profile). "
+    "Both are injected into every turn — keep them compact.\n\n"
+
+    "MEMORY GATE — enforce strictly on EVERY memory write:\n\n"
+
+    "MEMORY.md accepts ONLY cross-project technical facts that apply regardless "
+    "of which project is active. Examples: tool quirks, environment details, "
+    "git conventions, pointers to project note files, and stable workflows.\n\n"
+
+    "USER.md accepts ONLY personal facts about the user: name, role, "
+    "communication preferences, working style. Nothing technical.\n\n"
+
+    "REJECT from both files — write to project notes or state files instead:\n"
+    "- ANY project-specific rule, convention, or workflow (→ project rule file)\n"
+    "- ANY project-specific state: repo state, open PRs, branch names, "
+    "cron job IDs, installed packages, source counts (→ project autonomous-state file)\n"
+    "- Task progress, session outcomes, completed-work logs, TODO state "
+    "(→ use session_search to recall from past transcripts)\n"
+    "- Anything that will be stale next session\n"
+    "- Procedural how-to knowledge (→ save as a skill instead)\n\n"
+
+    "Before every memory write, ask: 'Does this apply to ALL projects and "
+    "ALL sessions, or just this one?' If just this one, it does not belong "
+    "in memory. Write it to the project's notes directory instead.\n\n"
+
+    "When in doubt, do NOT save to memory. Let the user ask you to."
 )
+
 
 SESSION_SEARCH_GUIDANCE = (
     "When the user references something from a past conversation or you suspect "

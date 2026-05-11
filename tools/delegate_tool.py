@@ -1486,10 +1486,12 @@ def _run_single_child(
         # Python stack (see #14726 — 0-API-call hangs are opaque without it).
         _worker_thread_holder: Dict[str, Optional[threading.Thread]] = {"t": None}
 
+        # Goal already lives in the child's system prompt (YOUR TASK section);
+        # sending it again here would duplicate it in the child's context.
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
             return child.run_conversation(
-                user_message=goal,
+                user_message="Begin.",
                 task_id=child_task_id,
             )
 

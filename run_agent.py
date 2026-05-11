@@ -148,7 +148,7 @@ from agent.model_metadata import (
 )
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
-from agent.prompt_caching import apply_anthropic_cache_control
+from agent.prompt_caching import apply_anthropic_cache_control, apply_anthropic_tools_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.codex_responses_adapter import (
@@ -361,6 +361,33 @@ _DESTRUCTIVE_PATTERNS = re.compile(
 )
 # Output redirects that overwrite files (> but not >>)
 _REDIRECT_OVERWRITE = re.compile(r'[^>]>[^>]|^>[^>]')
+
+# Personality file-reference pattern: ``file:/path/to/persona.md``
+_PERSONALITY_FILE_RE = re.compile(r'^file:(.+)$', re.IGNORECASE)
+
+
+def _resolve_personality_file_ref(value: Optional[str]) -> Optional[str]:
+    """Resolve a ``file:<path>`` personality reference to its file contents.
+
+    If *value* matches ``file:<path>`` (case-insensitive), the file at
+    *<path>* is read and its stripped contents returned.  ``~`` is expanded
+    to the user home directory.  If the file cannot be read a ``ValueError``
+    is raised with a descriptive message.
+
+    If *value* does not match the pattern it is returned unchanged.
+    """
+    if not value:
+        return value
+    m = _PERSONALITY_FILE_RE.match(value.strip())
+    if not m:
+        return value
+    file_path = Path(m.group(1).strip()).expanduser()
+    try:
+        return file_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError(
+            f"Cannot load personality file '{file_path}': {exc}"
+        ) from exc
 
 
 def _is_destructive_command(cmd: str) -> bool:
@@ -904,6 +931,32 @@ class AIAgent:
         self._base_url = value
         self._base_url_lower = value.lower() if value else ""
         self._base_url_hostname = base_url_hostname(value)
+
+    @property
+    def ephemeral_system_prompt(self) -> Optional[str]:
+        return self._ephemeral_system_prompt
+
+    @ephemeral_system_prompt.setter
+    def ephemeral_system_prompt(self, value: Optional[str]) -> None:
+        """Accept either a plain prompt string or a ``file:<path>`` reference.
+
+        When *value* matches ``file:<path>``, the file is read once per
+        session and cached by path. If the same path is set again the cached
+        content is reused — mid-session file edits are not picked up until a
+        new session starts. A different path triggers a fresh read and cache.
+        Plain strings are stored as-is. ``None`` or empty string clears the
+        ephemeral prompt.
+        """
+        m = _PERSONALITY_FILE_RE.match((value or "").strip())
+        if m:
+            path_str = m.group(1).strip()
+            cache = getattr(self, "_personality_file_cache", {})
+            if path_str not in cache:
+                cache[path_str] = _resolve_personality_file_ref(value) or ""
+                self._personality_file_cache = cache
+            self._ephemeral_system_prompt = cache[path_str] or None
+        else:
+            self._ephemeral_system_prompt = _resolve_personality_file_ref(value) or None
 
     def __init__(
         self,
@@ -2309,6 +2362,9 @@ class AIAgent:
         
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
+
+        # Clear personality file cache so /new picks up file changes.
+        self._personality_file_cache = {}
 
         # Context engine reset (works for both built-in compressor and plugins)
         if hasattr(self, "context_compressor") and self.context_compressor:
@@ -10592,13 +10648,21 @@ class AIAgent:
                     self._sanitize_tool_calls_for_strict_api(api_msg)
                 api_messages.append(api_msg)
 
-            effective_system = self._cached_system_prompt or ""
+            system_blocks: List[Dict[str, Any]] = []
+            if self._cached_system_prompt:
+                system_blocks.append(
+                    {"type": "text", "text": self._cached_system_prompt}
+                )
             if self.ephemeral_system_prompt:
-                effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
-            if effective_system:
-                api_messages = [{"role": "system", "content": effective_system}] + api_messages
+                system_blocks.append(
+                    {"type": "text", "text": self.ephemeral_system_prompt}
+                )
+            if system_blocks:
+                api_messages = [
+                    {"role": "system", "content": system_blocks}
+                ] + api_messages
             if self.prefill_messages:
-                sys_offset = 1 if effective_system else 0
+                sys_offset = 1 if system_blocks else 0
                 for idx, pfm in enumerate(self.prefill_messages):
                     api_messages.insert(sys_offset + idx, pfm.copy())
 
@@ -11334,40 +11398,36 @@ class AIAgent:
                 # The signature field helps maintain reasoning continuity
                 api_messages.append(api_msg)
 
-            # Build the final system message: cached prompt + ephemeral system prompt.
-            # Ephemeral additions are API-call-time only (not persisted to session DB).
-            # External recall context is injected into the user message, not the system
-            # prompt, so the stable cache prefix remains unchanged.
-            effective_system = active_system_prompt or ""
+            # Build the system message as a list of text blocks: the cached
+            # prompt and the ephemeral system prompt are emitted as separate
+            # blocks so downstream code (and prompt caching) can treat them
+            # independently. Ephemeral additions are API-call-time only and
+            # are not persisted to the session DB. External recall context
+            # is injected into the user message, not the system prompt.
+            system_blocks: List[Dict[str, Any]] = []
+            if active_system_prompt:
+                system_blocks.append(
+                    {"type": "text", "text": active_system_prompt}
+                )
             if self.ephemeral_system_prompt:
-                effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+                system_blocks.append(
+                    {"type": "text", "text": self.ephemeral_system_prompt}
+                )
             # NOTE: Plugin context from pre_llm_call hooks is injected into the
             # user message (see injection block above), NOT the system prompt.
             # This is intentional — system prompt modifications break the prompt
             # cache prefix.  The system prompt is reserved for Hermes internals.
-            if effective_system:
-                api_messages = [{"role": "system", "content": effective_system}] + api_messages
+            if system_blocks:
+                api_messages = [
+                    {"role": "system", "content": system_blocks}
+                ] + api_messages
 
             # Inject ephemeral prefill messages right after the system prompt
             # but before conversation history. Same API-call-time-only pattern.
             if self.prefill_messages:
-                sys_offset = 1 if effective_system else 0
+                sys_offset = 1 if system_blocks else 0
                 for idx, pfm in enumerate(self.prefill_messages):
                     api_messages.insert(sys_offset + idx, pfm.copy())
-
-            # Apply Anthropic prompt caching for Claude models on native
-            # Anthropic, OpenRouter, and third-party Anthropic-compatible
-            # gateways. Auto-detected: if ``_use_prompt_caching`` is set,
-            # inject cache_control breakpoints (system + last 3 messages)
-            # to reduce input token costs by ~75% on multi-turn
-            # conversations. Layout is chosen per endpoint by
-            # ``_anthropic_prompt_cache_policy``.
-            if self._use_prompt_caching:
-                api_messages = apply_anthropic_cache_control(
-                    api_messages,
-                    cache_ttl=self._cache_ttl,
-                    native_anthropic=self._use_native_cache_layout,
-                )
 
             # Safety net: strip orphaned tool results / add stubs for missing
             # results before sending to the API.  Runs unconditionally — not
@@ -11530,6 +11590,22 @@ class AIAgent:
                     api_kwargs = self._build_api_kwargs(api_messages)
                     if self._force_ascii_payload:
                         _sanitize_structure_non_ascii(api_kwargs)
+                    if self._use_prompt_caching and self.api_mode == "anthropic_messages":
+                        if api_kwargs.get("tools"):
+                            api_kwargs["tools"] = apply_anthropic_tools_cache_control(
+                                api_kwargs["tools"],
+                                cache_ttl=self._cache_ttl,
+                            )
+                        # Apply message-level cache markers AFTER kwargs are
+                        # built so the function sees the final shape of
+                        # ``messages`` (post-relocation) and can mark every
+                        # ``<system-reminder>`` plus the rolling-tail message.
+                        if api_kwargs.get("messages"):
+                            api_kwargs["messages"] = apply_anthropic_cache_control(
+                                api_kwargs["messages"],
+                                cache_ttl=self._cache_ttl,
+                                native_anthropic=self._use_native_cache_layout,
+                            )
                     if self.api_mode == "codex_responses":
                         api_kwargs = self._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
 
@@ -11624,6 +11700,7 @@ class AIAgent:
                         # Log response with provider info if available
                         resp_model = getattr(response, 'model', 'N/A') if response else 'N/A'
                         logging.debug(f"API Response received - Model: {resp_model}, Usage: {response.usage if hasattr(response, 'usage') else 'N/A'}")
+                    logger.debug("[%s] msg #%d response.usage raw: %s", self.session_id, self.session_api_calls + 1, getattr(response, "usage", None))
                     
                     # Validate response shape before proceeding
                     response_invalid = False

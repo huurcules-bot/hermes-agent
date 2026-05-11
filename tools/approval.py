@@ -320,6 +320,14 @@ DANGEROUS_PATTERNS = [
     # a script is first made executable then immediately run. The script
     # content may contain dangerous commands that individual patterns miss.
     (r'\bchmod\s+\+x\b.*[;&|]+\s*\./', "chmod +x followed by immediate execution"),
+    # Job application submit gate — submitting a job application is an
+    # irreversible action that requires Charlotte's explicit approval.
+    # Without yolo mode, the terminal tool will prompt for approval.
+    (r'\bapply_job\.py\s+submit\b', "submit job application (requires explicit approval)"),
+    # Job application nuclear cleanup — bare `cleanup` with no URL kills ALL live Chrome
+    # sessions and pickles, destroying every in-flight fill. Requires explicit approval.
+    # Per-URL cleanup (`cleanup <url>`) is safe and NOT gated — it only removes one fill.
+    (r'\bapply_job\.py\s+cleanup\s*$', "cleanup all job application sessions (destroys all in-flight fills)"),
 ]
 
 

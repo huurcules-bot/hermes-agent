@@ -811,13 +811,16 @@ class ProcessRegistry:
         # _move_to_finished(), producing duplicate [IMPORTANT: ...] messages.
         if was_running and session.notify_on_complete:
             from tools.ansi_strip import strip_ansi
-            output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
+            # Send the full output buffer — no tail truncation.  The CLI
+            # _print_user_message_preview call receives this as an [IMPORTANT:
+            # ...] message and must print it verbatim (see cli.py patch).
+            output_full = strip_ansi(session.output_buffer) if session.output_buffer else ""
             self.completion_queue.put({
                 "type": "completion",
                 "session_id": session.id,
                 "command": session.command,
                 "exit_code": session.exit_code,
-                "output": output_tail,
+                "output": output_full,
             })
 
     # ----- Query Methods -----

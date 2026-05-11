@@ -1659,18 +1659,22 @@ def _resolve_attachment_path(raw_path: str) -> Path | None:
     return resolved
 
 
-def _format_process_notification(evt: dict) -> "str | None":
+def _format_process_notification(evt: dict) -> "tuple[str, bool] | None":
     """Format a process notification event into a [IMPORTANT: ...] message.
 
     Handles both completion events (notify_on_complete) and watch pattern
     match events from the unified completion_queue.
+
+    Returns (message, verbatim) where verbatim=True means the CLI should print
+    the output without truncation (used for apply_job.py fill completions so
+    the full form viewer reaches the terminal without agent relay).
     """
     evt_type = evt.get("type", "completion")
     _sid = evt.get("session_id", "unknown")
     _cmd = evt.get("command", "unknown")
 
     if evt_type == "watch_disabled":
-        return f"[IMPORTANT: {evt.get('message', '')}]"
+        return (f"[IMPORTANT: {evt.get('message', '')}]", False)
 
     if evt_type == "watch_match":
         _pat = evt.get("pattern", "?")
@@ -1685,17 +1689,26 @@ def _format_process_notification(evt: dict) -> "str | None":
         if _sup:
             text += f"\n({_sup} earlier matches were suppressed by rate limit)"
         text += "]"
-        return text
+        return (text, False)
 
     # Default: completion event
     _exit = evt.get("exit_code", "?")
     _out = evt.get("output", "")
-    return (
+    message = (
         f"[IMPORTANT: Background process {_sid} completed "
         f"(exit code {_exit}).\n"
         f"Command: {_cmd}\n"
         f"Output:\n{_out}]"
     )
+    # apply_job.py fill completions and cdp_form_tools/greenhouse read commands
+    # carry the full form viewer — print verbatim so Charlotte sees the Q:/A:
+    # output in the terminal without agent relay or truncation.
+    verbatim = (
+        "apply_job.py fill" in _cmd
+        or "cdp_form_tools.py" in _cmd and "read" in _cmd
+        or "greenhouse.py" in _cmd and "read" in _cmd
+    )
+    return (message, verbatim)
 
 
 def _detect_file_drop(user_input: str) -> "dict | None":
@@ -3364,11 +3377,17 @@ class HermesCLI:
 
         return paste_ref_re.sub(_expand_ref, text)
 
-    def _print_user_message_preview(self, user_input: str) -> None:
-        """Render a user message using the normal chat scrollback style."""
+    def _print_user_message_preview(self, user_input: str, verbatim: bool = False) -> None:
+        """Render a user message using the normal chat scrollback style.
+
+        When verbatim=True (e.g. apply_job.py fill completion), print the full
+        text without truncation so the form viewer reaches the terminal intact.
+        """
         ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
         text = str(user_input or "")
-        if "\n" in text:
+        if verbatim:
+            _cprint(text)
+        elif "\n" in text:
             ChatConsole().print(self._format_submitted_user_message_preview(text))
         else:
             ChatConsole().print(f"[bold {_accent_hex()}]●[/] [bold]{_escape(text)}[/]")
@@ -5867,7 +5886,11 @@ class HermesCLI:
             except (KeyboardInterrupt, EOFError):
                 pass
 
-        if self._app:
+        # run_in_terminal requires an asyncio event loop — only available in the
+        # main prompt_toolkit thread.  If called from a background thread (e.g.
+        # process_loop handles /new), fall back to direct input() call.
+        in_main_thread = threading.current_thread() is threading.main_thread()
+        if self._app and in_main_thread:
             from prompt_toolkit.application import run_in_terminal
             was_visible = self._status_bar_visible
             self._status_bar_visible = False
@@ -6361,18 +6384,12 @@ class HermesCLI:
             if personality_name in ("none", "default", "neutral"):
                 self.system_prompt = ""
                 self.agent = None  # Force re-init
-                if save_config_value("agent.system_prompt", ""):
-                    print("(^_^)b Personality cleared (saved to config)")
-                else:
-                    print("(^_^) Personality cleared (session only)")
+                print("(^_^) Personality cleared (session only)")
                 print("  No personality overlay — using base agent behavior.")
             elif personality_name in self.personalities:
                 self.system_prompt = self._resolve_personality_prompt(self.personalities[personality_name])
                 self.agent = None  # Force re-init
-                if save_config_value("agent.system_prompt", self.system_prompt):
-                    print(f"(^_^)b Personality set to '{personality_name}' (saved to config)")
-                else:
-                    print(f"(^_^) Personality set to '{personality_name}' (session only)")
+                print(f"(^_^) Personality set to '{personality_name}' (session only)")
                 print(f"  \"{self.system_prompt[:60]}{'...' if len(self.system_prompt) > 60 else ''}\"")
             else:
                 print(f"(._.) Unknown personality: {personality_name}")
@@ -6913,12 +6930,6 @@ class HermesCLI:
         elif canonical == "new":
             parts = cmd_original.split(maxsplit=1)
             title = parts[1].strip() if len(parts) > 1 else None
-            if self._confirm_destructive_slash(
-                "new",
-                "This starts a fresh session.\n"
-                "The current conversation history will be discarded.",
-            ) is None:
-                return
             self.new_session(title=title)
         elif canonical == "resume":
             self._handle_resume_command(cmd_original)
@@ -12313,6 +12324,8 @@ class HermesCLI:
                                     else:
                                         _synth = _format_process_notification(evt)
                                         if _synth:
+                                            # Put (message, verbatim) tuple so the
+                                            # display path can bypass truncation for fills.
                                             self._pending_input.put(_synth)
                             except Exception:
                                 pass
@@ -12320,6 +12333,13 @@ class HermesCLI:
                     
                     if not user_input:
                         continue
+
+                    # Unpack process-notification payload: (message_str, verbatim_bool)
+                    # This must come before the image-tuple unpack below, which expects
+                    # (text, [Path, ...]).  Notification tuples have a bool as second element.
+                    _preview_verbatim = False
+                    if isinstance(user_input, tuple) and len(user_input) == 2 and isinstance(user_input[1], bool):
+                        user_input, _preview_verbatim = user_input
 
                     # Unpack image payload: (text, [Path, ...]) or plain str
                     submit_images = []
@@ -12364,7 +12384,7 @@ class HermesCLI:
                     if paste_refs:
                         user_input = self._expand_paste_references(user_input)
                     print()
-                    self._print_user_message_preview(user_input)
+                    self._print_user_message_preview(user_input, verbatim=_preview_verbatim)
                     
                     # Show image attachment count
                     if submit_images:

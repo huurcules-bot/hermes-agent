@@ -6,6 +6,7 @@ import pytest
 from agent.prompt_caching import (
     _apply_cache_marker,
     apply_anthropic_cache_control,
+    apply_anthropic_tools_cache_control,
 )
 
 
@@ -78,59 +79,125 @@ class TestApplyAnthropicCacheControl:
         # Original should be unmodified
         assert "cache_control" not in msgs[0].get("content", "")
 
-    def test_system_message_gets_marker(self):
+    def test_marks_only_last_message_when_no_system_reminders(self):
         msgs = [
-            {"role": "system", "content": "You are helpful"},
-            {"role": "user", "content": "Hi"},
-        ]
-        result = apply_anthropic_cache_control(msgs)
-        # System message should have cache_control
-        sys_content = result[0]["content"]
-        assert isinstance(sys_content, list)
-        assert sys_content[0]["cache_control"]["type"] == "ephemeral"
-
-    def test_last_3_non_system_get_markers(self):
-        msgs = [
-            {"role": "system", "content": "System"},
             {"role": "user", "content": "msg1"},
             {"role": "assistant", "content": "msg2"},
             {"role": "user", "content": "msg3"},
-            {"role": "assistant", "content": "msg4"},
         ]
         result = apply_anthropic_cache_control(msgs)
-        # System (index 0) + last 3 non-system (indices 2, 3, 4) = 4 breakpoints
-        # Index 1 (msg1) should NOT have marker
-        content_1 = result[1]["content"]
-        if isinstance(content_1, str):
-            assert True  # No marker applied (still a string)
-        else:
-            assert "cache_control" not in content_1[0]
+        # Earlier messages: no marker
+        for i in range(2):
+            content = result[i]["content"]
+            if isinstance(content, list):
+                assert "cache_control" not in content[-1]
+        # Last message: marker
+        last_content = result[-1]["content"]
+        assert isinstance(last_content, list)
+        assert last_content[-1]["cache_control"] == {"type": "ephemeral"}
 
-    def test_no_system_message(self):
+    def test_marks_every_system_reminder_message(self):
         msgs = [
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<system-reminder>\nstable\n</system-reminder>"}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<system-reminder>\nephemeral\n</system-reminder>"}
+                ],
+            },
+            {"role": "user", "content": "actual prompt"},
         ]
         result = apply_anthropic_cache_control(msgs)
-        # Both should get markers (4 slots available, only 2 messages)
-        assert len(result) == 2
+        # Both <system-reminder> messages get markers.
+        assert result[0]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+        assert result[1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+        # The last message also gets a marker.
+        last_content = result[-1]["content"]
+        assert isinstance(last_content, list)
+        assert last_content[-1]["cache_control"] == {"type": "ephemeral"}
+
+    def test_does_not_mark_non_reminder_messages_in_the_middle(self):
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<system-reminder>\nstable\n</system-reminder>"}
+                ],
+            },
+            {"role": "user", "content": "first turn"},
+            {"role": "assistant", "content": "reply"},
+            {"role": "user", "content": "second turn"},
+        ]
+        result = apply_anthropic_cache_control(msgs)
+        # The reminder message is marked.
+        assert result[0]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+        # Middle non-reminder messages are NOT marked.
+        for i in (1, 2):
+            content = result[i]["content"]
+            if isinstance(content, list):
+                assert "cache_control" not in content[-1]
+        # The last message is marked.
+        assert isinstance(result[-1]["content"], list)
+        assert result[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+    def test_recognises_string_content_starting_with_system_reminder(self):
+        msgs = [
+            {"role": "user", "content": "<system-reminder>\nstable\n</system-reminder>"},
+            {"role": "user", "content": "actual prompt"},
+        ]
+        result = apply_anthropic_cache_control(msgs)
+        # String content gets normalized into a list with the marker.
+        first_content = result[0]["content"]
+        assert isinstance(first_content, list)
+        assert first_content[-1]["cache_control"] == {"type": "ephemeral"}
+
+    def test_last_message_marked_once_when_it_is_a_system_reminder(self):
+        # Only one message and it IS a system-reminder — it should still
+        # only carry a single marker.
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<system-reminder>\nonly\n</system-reminder>"}
+                ],
+            },
+        ]
+        result = apply_anthropic_cache_control(msgs)
+        block = result[0]["content"][-1]
+        assert block["cache_control"] == {"type": "ephemeral"}
 
     def test_1h_ttl(self):
-        msgs = [{"role": "system", "content": "System prompt"}]
-        result = apply_anthropic_cache_control(msgs, cache_ttl="1h")
-        sys_content = result[0]["content"]
-        assert isinstance(sys_content, list)
-        assert sys_content[0]["cache_control"]["ttl"] == "1h"
-
-    def test_max_4_breakpoints(self):
         msgs = [
-            {"role": "system", "content": "System"},
-        ] + [
-            {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg{i}"}
-            for i in range(10)
+            {"role": "user", "content": "Hello"},
+        ]
+        result = apply_anthropic_cache_control(msgs, cache_ttl="1h")
+        last = result[-1]["content"]
+        assert isinstance(last, list)
+        assert last[-1]["cache_control"]["ttl"] == "1h"
+
+    def test_at_most_one_marker_per_message_block(self):
+        # Two reminders + last message = 3 total markers max here.
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<system-reminder>\nstable\n</system-reminder>"}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<system-reminder>\nephemeral\n</system-reminder>"}
+                ],
+            },
+            {"role": "user", "content": "tail"},
         ]
         result = apply_anthropic_cache_control(msgs)
-        # Count how many messages have cache_control
         count = 0
         for msg in result:
             content = msg.get("content")
@@ -140,4 +207,42 @@ class TestApplyAnthropicCacheControl:
                         count += 1
             elif "cache_control" in msg:
                 count += 1
-        assert count <= 4
+        assert count == 3
+
+
+class TestApplyAnthropicToolsCacheControl:
+    def test_none_returns_none(self):
+        assert apply_anthropic_tools_cache_control(None) is None
+
+    def test_empty_list_returns_input_unchanged(self):
+        tools = []
+        assert apply_anthropic_tools_cache_control(tools) is tools
+
+    def test_single_tool_gets_marker(self):
+        tools = [{"name": "Bash", "description": "shell", "input_schema": {}}]
+        result = apply_anthropic_tools_cache_control(tools)
+        assert result[0]["cache_control"] == {"type": "ephemeral"}
+
+    def test_multi_tool_only_last_gets_marker(self):
+        tools = [
+            {"name": "Bash", "description": "shell", "input_schema": {}},
+            {"name": "Read", "description": "read file", "input_schema": {}},
+            {"name": "Write", "description": "write file", "input_schema": {}},
+        ]
+        result = apply_anthropic_tools_cache_control(tools)
+        assert "cache_control" not in result[0]
+        assert "cache_control" not in result[1]
+        assert result[2]["cache_control"] == {"type": "ephemeral"}
+
+    def test_1h_ttl_sets_ttl_field(self):
+        tools = [{"name": "Bash", "description": "shell", "input_schema": {}}]
+        result = apply_anthropic_tools_cache_control(tools, cache_ttl="1h")
+        assert result[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+    def test_returns_deep_copy(self):
+        tools = [{"name": "Bash", "description": "shell", "input_schema": {}}]
+        result = apply_anthropic_tools_cache_control(tools)
+        # Mutations to the result must not bleed into the input.
+        assert result is not tools
+        assert result[0] is not tools[0]
+        assert "cache_control" not in tools[0]

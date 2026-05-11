@@ -1,15 +1,23 @@
-"""Anthropic prompt caching (system_and_3 strategy).
+"""Anthropic prompt caching.
 
-Reduces input token costs by ~75% on multi-turn conversations by caching
-the conversation prefix. Uses 4 cache_control breakpoints (Anthropic max):
-  1. System prompt (stable across all turns)
-  2-4. Last 3 non-system messages (rolling window)
+Reduces input token costs by placing ``cache_control: ephemeral``
+breakpoints at stable cut-points in the request. Anthropic allows up to 4
+breakpoints; this module places message-level ones. Tools-list breakpoint
+lives in ``apply_anthropic_tools_cache_control``.
+
+``apply_anthropic_cache_control`` marks two kinds of messages:
+  - every text content block that starts with ``<system-reminder>``
+    (each system-reminder block gets its own breakpoint)
+  - the very last message in ``messages`` (rolling tail)
 
 Pure functions -- no class state, no AIAgent dependency.
 """
 
 import copy
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+
+_SYSTEM_REMINDER_PREFIX = "<system-reminder>"
 
 
 def _apply_cache_marker(msg: dict, cache_marker: dict, native_anthropic: bool = False) -> None:
@@ -43,9 +51,12 @@ def apply_anthropic_cache_control(
     cache_ttl: str = "5m",
     native_anthropic: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Apply system_and_3 caching strategy to messages for Anthropic models.
+    """Mark cache breakpoints on ``<system-reminder>`` content blocks and the last message.
 
-    Places up to 4 cache_control breakpoints: system prompt + last 3 non-system messages.
+    For each message, iterates every content block and adds ``cache_control``
+    to each text block whose text starts with ``<system-reminder>``. Plain
+    string content is converted to a block first. Also marks the final message
+    as a rolling-tail breakpoint.
 
     Returns:
         Deep copy of messages with cache_control breakpoints injected.
@@ -58,15 +69,48 @@ def apply_anthropic_cache_control(
     if cache_ttl == "1h":
         marker["ttl"] = "1h"
 
-    breakpoints_used = 0
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, str):
+            if content.startswith(_SYSTEM_REMINDER_PREFIX):
+                _apply_cache_marker(msg, marker, native_anthropic=native_anthropic)
+        elif isinstance(content, list):
+            for block in content:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and isinstance(block.get("text"), str)
+                    and block["text"].startswith(_SYSTEM_REMINDER_PREFIX)
+                ):
+                    block["cache_control"] = marker
 
-    if messages[0].get("role") == "system":
-        _apply_cache_marker(messages[0], marker, native_anthropic=native_anthropic)
-        breakpoints_used += 1
-
-    remaining = 4 - breakpoints_used
-    non_sys = [i for i in range(len(messages)) if messages[i].get("role") != "system"]
-    for idx in non_sys[-remaining:]:
-        _apply_cache_marker(messages[idx], marker, native_anthropic=native_anthropic)
+    _apply_cache_marker(messages[-1], marker, native_anthropic=native_anthropic)
 
     return messages
+
+
+def apply_anthropic_tools_cache_control(
+    tools: Optional[List[Dict[str, Any]]],
+    cache_ttl: str = "5m",
+) -> Optional[List[Dict[str, Any]]]:
+    """Mark the last tool with ``cache_control: ephemeral``.
+
+    Anthropic caches up to and including the marked block, so a single mark
+    on the final tool keeps the entire tools list in the cached prefix.
+    Tool schemas are stable across all turns in a session, so this trades
+    one ephemeral cache slot for amortising the (often very large) tool
+    schema cost across the whole session.
+
+    Returns a deep copy with the marker on the last tool. Returns the input
+    unchanged when ``tools`` is None or empty (no tool to mark).
+    """
+    if not tools:
+        return tools
+    out = copy.deepcopy(tools)
+    marker: Dict[str, Any] = {"type": "ephemeral"}
+    if cache_ttl == "1h":
+        marker["ttl"] = "1h"
+    last = out[-1]
+    if isinstance(last, dict):
+        last["cache_control"] = marker
+    return out

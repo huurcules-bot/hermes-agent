@@ -1479,16 +1479,12 @@ def convert_messages_to_anthropic(
 
         if role == "system":
             if isinstance(content, list):
-                # Preserve cache_control markers on content blocks
-                has_cache = any(
-                    p.get("cache_control") for p in content if isinstance(p, dict)
-                )
-                if has_cache:
-                    system = [p for p in content if isinstance(p, dict)]
-                else:
-                    system = "\n".join(
-                        p["text"] for p in content if p.get("type") == "text"
-                    )
+                # Preserve the list shape: callers emit separate text blocks
+                # intentionally (e.g. cached prompt vs ephemeral system prompt).
+                # Collapsing here would erase that boundary before downstream
+                # consumers (cache breakpoints, OAuth identity detection) get
+                # to see it.
+                system = [p for p in content if isinstance(p, dict)]
             else:
                 system = content
             continue

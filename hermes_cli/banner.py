@@ -131,40 +131,71 @@ _UPSTREAM_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
 
 
 def _check_via_rev(local_rev: str) -> Optional[int]:
-    """Compare an embedded git revision to upstream main via ls-remote.
+    """Compare an embedded git revision to the latest upstream release tag via ls-remote.
 
     Returns 0 if up-to-date, ``UPDATE_AVAILABLE_NO_COUNT`` if behind,
     or ``None`` on failure.
     """
     try:
         result = subprocess.run(
-            ["git", "ls-remote", _UPSTREAM_REPO_URL, "refs/heads/main"],
+            ["git", "ls-remote", "--tags", "--sort=-version:refname", _UPSTREAM_REPO_URL],
             capture_output=True, text=True, timeout=10,
         )
     except Exception:
         return None
     if result.returncode != 0 or not result.stdout:
         return None
-    upstream_rev = result.stdout.split()[0]
-    if not upstream_rev:
-        return None
-    return 0 if upstream_rev == local_rev else UPDATE_AVAILABLE_NO_COUNT
+    # Lines are "<sha>\trefs/tags/<name>" — skip ^{} peeled lines
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and not parts[1].endswith("^{}"):
+            upstream_rev = parts[0]
+            if not upstream_rev:
+                continue
+            return 0 if upstream_rev == local_rev else UPDATE_AVAILABLE_NO_COUNT
+    return None
 
 
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
+    """Count commits behind the latest release tag in a local checkout."""
     try:
         subprocess.run(
-            ["git", "fetch", "origin", "--quiet"],
+            ["git", "fetch", "origin", "--tags", "--quiet"],
             capture_output=True, timeout=10,
             cwd=str(repo_dir),
         )
     except Exception:
         pass  # Offline or timeout — use stale refs, that's fine
 
+    # Resolve the latest tag by semver ordering
+    try:
+        tag_result = subprocess.run(
+            ["git", "tag", "--sort=-version:refname"],
+            capture_output=True, text=True, timeout=5,
+            cwd=str(repo_dir),
+        )
+        tags = [t.strip() for t in tag_result.stdout.splitlines() if t.strip()]
+        latest_tag = tags[0] if tags else None
+    except Exception:
+        latest_tag = None
+
+    if not latest_tag:
+        # No tags — fall back to origin/main
+        try:
+            result = subprocess.run(
+                ["git", "rev-list", "--count", "HEAD..origin/main"],
+                capture_output=True, text=True, timeout=5,
+                cwd=str(repo_dir),
+            )
+            if result.returncode == 0:
+                return int(result.stdout.strip())
+        except Exception:
+            pass
+        return None
+
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "rev-list", "--count", f"HEAD..{latest_tag}"],
             capture_output=True, text=True, timeout=5,
             cwd=str(repo_dir),
         )
@@ -179,8 +210,8 @@ def check_for_updates() -> Optional[int]:
     """Check whether a Hermes update is available.
 
     Two paths: if ``HERMES_REVISION`` is set (nix builds embed it), compare
-    it to upstream main via ``git ls-remote``. Otherwise look for a local
-    git checkout and count commits behind ``origin/main``.
+    it to the latest upstream release tag via ``git ls-remote``. Otherwise
+    look for a local git checkout and count commits behind the latest tag.
 
     Returns the number of commits behind, ``UPDATE_AVAILABLE_NO_COUNT`` (-1)
     if behind but the count is unknown, ``0`` if up-to-date, or ``None`` if
@@ -254,7 +285,18 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     if repo_dir is None:
         return None
 
-    upstream = _git_short_hash(repo_dir, "origin/main")
+    # Prefer the latest release tag as the upstream reference; fall back to origin/main
+    try:
+        tag_result = subprocess.run(
+            ["git", "tag", "--sort=-version:refname"],
+            capture_output=True, text=True, timeout=5, cwd=str(repo_dir),
+        )
+        tags = [t.strip() for t in tag_result.stdout.splitlines() if t.strip()]
+        upstream_ref = tags[0] if tags else "origin/main"
+    except Exception:
+        upstream_ref = "origin/main"
+
+    upstream = _git_short_hash(repo_dir, upstream_ref)
     local = _git_short_hash(repo_dir, "HEAD")
     if not upstream or not local:
         return None
@@ -262,7 +304,7 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     ahead = 0
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "origin/main..HEAD"],
+            ["git", "rev-list", "--count", f"{upstream_ref}..HEAD"],
             capture_output=True,
             text=True,
             timeout=5,

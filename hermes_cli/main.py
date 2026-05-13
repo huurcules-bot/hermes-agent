@@ -5818,6 +5818,24 @@ def _kill_stale_dashboard_processes(
 _warn_stale_dashboard_processes = _kill_stale_dashboard_processes
 
 
+def _fetch_latest_release_tag() -> Optional[str]:
+    """Return the latest release tag from the GitHub API, or None on failure."""
+    import urllib.request
+    import urllib.error
+
+    api_url = "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest"
+    try:
+        req = urllib.request.Request(
+            api_url, headers={"Accept": "application/vnd.github+json"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        tag = data.get("tag_name", "").strip()
+        return tag or None
+    except Exception:
+        return None
+
+
 def _update_via_zip(args):
     """Update Hermes Agent by downloading a ZIP archive.
 
@@ -5828,15 +5846,22 @@ def _update_via_zip(args):
     import zipfile
     from urllib.request import urlretrieve
 
-    branch = "main"
-    zip_url = (
-        f"https://github.com/NousResearch/hermes-agent/archive/refs/heads/{branch}.zip"
-    )
+    tag = _fetch_latest_release_tag()
+    if tag:
+        zip_url = (
+            f"https://github.com/NousResearch/hermes-agent/archive/refs/tags/{tag}.zip"
+        )
+        zip_label = tag
+        print(f"→ Downloading latest release ({tag})...")
+    else:
+        # Fallback: HEAD of main branch when the releases API is unreachable
+        zip_url = "https://github.com/NousResearch/hermes-agent/archive/refs/heads/main.zip"
+        zip_label = "main"
+        print("→ Downloading latest version (could not resolve release tag, using main)...")
 
-    print("→ Downloading latest version...")
     try:
         tmp_dir = tempfile.mkdtemp(prefix="hermes-update-")
-        zip_path = os.path.join(tmp_dir, f"hermes-agent-{branch}.zip")
+        zip_path = os.path.join(tmp_dir, f"hermes-agent-{zip_label}.zip")
         urlretrieve(zip_url, zip_path)
 
         print("→ Extracting...")
@@ -5854,8 +5879,8 @@ def _update_via_zip(args):
                     )
             zf.extractall(tmp_dir)
 
-        # GitHub ZIPs extract to hermes-agent-<branch>/
-        extracted = os.path.join(tmp_dir, f"hermes-agent-{branch}")
+        # GitHub ZIPs extract to hermes-agent-<label>/
+        extracted = os.path.join(tmp_dir, f"hermes-agent-{zip_label}")
         if not os.path.isdir(extracted):
             # Try to find it
             for d in os.listdir(tmp_dir):
@@ -6251,6 +6276,285 @@ def _mark_skip_upstream_prompt():
         (get_hermes_home() / SKIP_UPSTREAM_PROMPT_FILE).touch()
     except Exception:
         pass
+
+
+def _ensure_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
+    """Add the official upstream remote silently if not already present.
+
+    Returns True if the upstream remote is now available.
+    """
+    if _has_upstream_remote(git_cmd, cwd):
+        return True
+    added = _add_upstream_remote(git_cmd, cwd)
+    if added:
+        print("  ✓ Added upstream: https://github.com/NousResearch/hermes-agent.git")
+    else:
+        print("  ✗ Failed to add upstream remote.")
+    return added
+
+
+def _sync_fork_main_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
+    """Keep fork commits rebased on top of upstream/main.
+
+    Strategy: fetch upstream, identify commits that are on origin/main but
+    not on upstream/main (the fork's custom commits), rebase them onto
+    upstream/main, and force-push.  This keeps the fork's main as
+    upstream/main + custom commits on top — no merge commits ever.
+
+    Returns True if origin/main is in sync after this call.
+    """
+    print("→ Fetching upstream (NousResearch/hermes-agent)...")
+    fetch = subprocess.run(
+        git_cmd + ["fetch", "upstream", "--quiet"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if fetch.returncode != 0:
+        print("  ✗ Failed to fetch upstream. origin/main may be stale.")
+        return False
+
+    # Also fetch origin to ensure origin/main is up to date
+    subprocess.run(
+        git_cmd + ["fetch", "origin", "--quiet"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+
+    upstream_ahead = _count_commits_between(git_cmd, cwd, "origin/main", "upstream/main")
+    origin_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "origin/main")
+
+    if upstream_ahead < 0 or origin_ahead < 0:
+        print("  ✗ Could not compare upstream/main with origin/main. Skipping fork sync.")
+        return False
+
+    if upstream_ahead == 0 and origin_ahead == 0:
+        print("  ✓ Fork main is already in sync with upstream")
+        return True
+
+    if upstream_ahead == 0:
+        # Origin has custom commits but upstream hasn't moved — nothing to rebase
+        print(f"  ✓ Fork main has {origin_ahead} custom commit(s) on top of upstream (up to date)")
+        return True
+
+    if origin_ahead == 0:
+        # No custom commits — fast-forward origin/main to upstream/main
+        print(f"  → Upstream is {upstream_ahead} commit(s) ahead — fast-forwarding fork main...")
+        push = subprocess.run(
+            git_cmd + ["push", "origin", "upstream/main:refs/heads/main", "--force-with-lease"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        if push.returncode == 0:
+            print("  ✓ Fork main synced with upstream")
+            return True
+        # Fallback to --force
+        push2 = subprocess.run(
+            git_cmd + ["push", "origin", "upstream/main:refs/heads/main", "--force"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        if push2.returncode == 0:
+            print("  ✓ Fork main synced with upstream")
+            return True
+        print(f"  ✗ Could not sync fork main: {push2.stderr.strip()}")
+        return False
+
+    # Both sides have commits — rebase fork's custom commits onto upstream/main
+    print(f"  → Upstream is {upstream_ahead} commit(s) ahead, fork has {origin_ahead} custom commit(s)")
+    print(f"  → Rebasing {origin_ahead} fork commit(s) onto upstream/main...")
+
+    # Save current branch and state
+    current_branch_result = subprocess.run(
+        git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    current_branch = current_branch_result.stdout.strip() if current_branch_result.returncode == 0 else ""
+    was_on_main = current_branch == "main"
+
+    # Stash any uncommitted changes before rebase
+    had_stash = False
+    stash_check = subprocess.run(
+        git_cmd + ["status", "--porcelain"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if stash_check.returncode == 0 and stash_check.stdout.strip():
+        stash_result = subprocess.run(
+            git_cmd + ["stash", "push", "-m", "hermes-update-fork-sync"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        had_stash = stash_result.returncode == 0
+
+    # Ensure we're on main for the rebase
+    if not was_on_main:
+        checkout = subprocess.run(
+            git_cmd + ["checkout", "main"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        if checkout.returncode != 0:
+            print(f"  ✗ Could not checkout main: {checkout.stderr.strip()}")
+            if had_stash:
+                subprocess.run(git_cmd + ["stash", "pop"], cwd=cwd, capture_output=True, text=True)
+            return False
+
+    # Make sure local main matches origin/main before rebasing
+    subprocess.run(
+        git_cmd + ["reset", "--hard", "origin/main"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+
+    # Rebase: replay fork commits on top of upstream/main
+    rebase = subprocess.run(
+        git_cmd + ["rebase", "upstream/main"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if rebase.returncode != 0:
+        # Rebase conflict — abort and fall back to cherry-pick strategy
+        print("  ⚠ Rebase conflict — aborting rebase and trying cherry-pick...")
+        subprocess.run(
+            git_cmd + ["rebase", "--abort"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        # Reset to upstream/main and cherry-pick each fork commit
+        subprocess.run(
+            git_cmd + ["reset", "--hard", "upstream/main"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        # Get the fork commit SHAs (oldest first) from origin/main
+        commits_result = subprocess.run(
+            git_cmd + ["log", "--reverse", "--format=%H", "upstream/main..origin/main"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        if commits_result.returncode != 0 or not commits_result.stdout.strip():
+            print("  ✗ Could not identify fork commits for cherry-pick. Resetting to upstream.")
+            # Push upstream/main as-is (drops fork commits)
+            subprocess.run(
+                git_cmd + ["push", "origin", "upstream/main:refs/heads/main", "--force"],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+            )
+            if not was_on_main and current_branch:
+                subprocess.run(
+                    git_cmd + ["checkout", current_branch],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                )
+            if had_stash:
+                subprocess.run(git_cmd + ["stash", "pop"], cwd=cwd, capture_output=True, text=True)
+            return False
+
+        commit_shas = commits_result.stdout.strip().split("\n")
+        failed_commits = []
+        for sha in commit_shas:
+            cp = subprocess.run(
+                git_cmd + ["cherry-pick", sha],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+            )
+            if cp.returncode != 0:
+                # Skip this commit (likely already applied or conflicts)
+                subprocess.run(
+                    git_cmd + ["cherry-pick", "--abort"],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                )
+                failed_commits.append(sha[:12])
+
+        if failed_commits:
+            print(f"  ⚠ Skipped conflicting commits: {', '.join(failed_commits)}")
+
+    # Force-push the rebased main to origin
+    push = subprocess.run(
+        git_cmd + ["push", "origin", "main", "--force-with-lease"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if push.returncode != 0:
+        # force-with-lease rejected — someone pushed to origin/main since our
+        # fetch.  Re-fetch and retry once rather than using bare --force which
+        # would silently overwrite their work.
+        print("  ⚠ force-with-lease rejected — re-fetching and retrying...")
+        subprocess.run(
+            git_cmd + ["fetch", "origin", "--quiet"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        push = subprocess.run(
+            git_cmd + ["push", "origin", "main", "--force-with-lease"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+
+    if push.returncode == 0:
+        new_origin_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "HEAD")
+        if new_origin_ahead > 0:
+            print(f"  ✓ Fork main rebased: {new_origin_ahead} custom commit(s) on top of upstream")
+        else:
+            print("  ✓ Fork main synced with upstream")
+        # Restore original branch if we switched
+        if not was_on_main and current_branch:
+            subprocess.run(
+                git_cmd + ["checkout", current_branch],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+            )
+        # Restore stash
+        if had_stash:
+            subprocess.run(git_cmd + ["stash", "pop"], cwd=cwd, capture_output=True, text=True)
+        return True
+
+    print(f"  ✗ Could not push rebased main: {push.stderr.strip()}")
+    # Try to recover local state
+    subprocess.run(
+        git_cmd + ["reset", "--hard", "origin/main"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+
+    # Restore original branch if we switched
+    if not was_on_main and current_branch:
+        subprocess.run(
+            git_cmd + ["checkout", current_branch],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+
+    # Restore stash
+    if had_stash:
+        subprocess.run(git_cmd + ["stash", "pop"], cwd=cwd, capture_output=True, text=True)
+
+    return False
 
 
 def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
@@ -6725,10 +7029,10 @@ def _cmd_update_check():
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
 
-    # Fetch both origin and upstream; prefer upstream as the canonical reference
+    # Fetch tags from upstream (preferred) or origin
     print("→ Fetching from upstream...")
     fetch_result = subprocess.run(
-        git_cmd + ["fetch", "upstream"],
+        git_cmd + ["fetch", "upstream", "--tags"],
         cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
@@ -6737,16 +7041,14 @@ def _cmd_update_check():
         # Fallback to origin if upstream doesn't exist
         print("→ Fetching from origin...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin"],
+            git_cmd + ["fetch", "origin", "--tags"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
         )
         upstream_exists = False
-        compare_branch = "origin/main"
     else:
         upstream_exists = True
-        compare_branch = "upstream/main"
 
     if fetch_result.returncode != 0:
         stderr = fetch_result.stderr.strip()
@@ -6760,8 +7062,31 @@ def _cmd_update_check():
                 print(f"  {stderr.splitlines()[0]}")
         sys.exit(1)
 
+    # Resolve the latest tag
+    try:
+        tag_result = subprocess.run(
+            git_cmd + ["tag", "--sort=-version:refname"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        tags = [t.strip() for t in tag_result.stdout.splitlines() if t.strip()]
+        latest_tag = tags[0] if tags else None
+    except Exception:
+        latest_tag = None
+
+    if latest_tag:
+        compare_ref = latest_tag
+        print(f"→ Latest release tag: {latest_tag}")
+    elif upstream_exists:
+        compare_ref = "upstream/main"
+        print("  ⚠ No release tags found — comparing against upstream/main")
+    else:
+        compare_ref = "origin/main"
+        print("  ⚠ No release tags found — comparing against origin/main")
+
     rev_result = subprocess.run(
-        git_cmd + ["rev-list", f"HEAD..{compare_branch}", "--count"],
+        git_cmd + ["rev-list", f"HEAD..{compare_ref}", "--count"],
         cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
@@ -6773,7 +7098,7 @@ def _cmd_update_check():
         print("✓ Already up to date.")
     else:
         commits_word = "commit" if behind == 1 else "commits"
-        print(f"⚕ Update available: {behind} {commits_word} behind {compare_branch}.")
+        print(f"⚕ Update available: {behind} {commits_word} behind {compare_ref}.")
         from hermes_cli.config import recommended_update_command
 
         print(f"  Run '{recommended_update_command()}' to install.")
@@ -7056,6 +7381,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         print("⚠ Updating from fork:")
         print(f"  {origin_url}")
         print()
+        # Sync origin/main with upstream BEFORE fetching — so that when we
+        # pull from origin below, we're already pulling upstream's latest.
+        if _ensure_upstream_remote(git_cmd, PROJECT_ROOT):
+            _sync_fork_main_with_upstream(git_cmd, PROJECT_ROOT)
+        print()
 
     if use_zip_update:
         # ZIP-based update for Windows when git is broken
@@ -7089,6 +7419,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print(f"  {stderr.splitlines()[0]}")
             sys.exit(1)
 
+        # Fetch tags so we can resolve the latest release
+        subprocess.run(
+            git_cmd + ["fetch", "origin", "--tags"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+
         # Get current branch (returns literal "HEAD" when detached)
         result = subprocess.run(
             git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
@@ -7099,10 +7437,33 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
         current_branch = result.stdout.strip()
 
-        # Always update against main
-        branch = "main"
+        # Resolve the latest release tag.  Prefer GitHub API so we always get
+        # the canonical release even if the local tag list is stale or sparse.
+        # Fall back to the newest semver tag in the local fetch.
+        release_tag = _fetch_latest_release_tag()
+        if not release_tag:
+            try:
+                tag_result = subprocess.run(
+                    git_cmd + ["tag", "--sort=-version:refname"],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                tags = [t.strip() for t in tag_result.stdout.splitlines() if t.strip()]
+                release_tag = tags[0] if tags else None
+            except Exception:
+                release_tag = None
+
+        if release_tag:
+            print(f"→ Target release: {release_tag}")
+            target_ref = release_tag
+        else:
+            # Last resort: fall back to origin/main if no tags exist
+            print("  ⚠ No release tags found — falling back to origin/main")
+            target_ref = "origin/main"
 
         # If user is on a non-main branch or detached HEAD, switch to main
+        # first so the reset below lands cleanly on a known base.
         if current_branch != "main":
             label = (
                 "detached HEAD"
@@ -7130,7 +7491,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         # Check if there are updates
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{target_ref}", "--count"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -7178,36 +7539,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Never let a snapshot failure block an update.
             logger.debug("Pre-update snapshot failed: %s", exc)
 
-        print("→ Pulling updates...")
+        print("→ Updating to latest release...")
         update_succeeded = False
         try:
-            pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
+            reset_result = subprocess.run(
+                git_cmd + ["reset", "--hard", target_ref],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
             )
-            if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
+            if reset_result.returncode != 0:
+                print(f"✗ Failed to reset to {target_ref}.")
+                if reset_result.stderr.strip():
+                    print(f"  {reset_result.stderr.strip()}")
                 print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                    f"  Try manually: git fetch origin --tags && git reset --hard {target_ref}"
                 )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                    cwd=PROJECT_ROOT,
-                    capture_output=True,
-                    text=True,
-                )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
-                    print(
-                        "  Try manually: git fetch origin && git reset --hard origin/main"
-                    )
-                    sys.exit(1)
+                sys.exit(1)
             update_succeeded = True
         finally:
             if auto_stash_ref is not None:
@@ -7238,9 +7586,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
             )
 
-        # Fork upstream sync logic (only for main branch on forks)
-        if is_fork and branch == "main":
-            _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
+        # Fork upstream sync is now done BEFORE the local pull (see above).
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
         # breaks on this machine, keep base deps and reinstall the remaining extras

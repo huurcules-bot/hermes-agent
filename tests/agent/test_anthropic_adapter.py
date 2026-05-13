@@ -794,10 +794,18 @@ class TestConvertMessages:
         assert system[0]["cache_control"] == {"type": "ephemeral"}
 
     def test_assistant_cache_control_blocks_are_preserved(self):
-        messages = apply_anthropic_cache_control([
+        # Verify convert_messages_to_anthropic preserves cache_control markers
+        # on assistant messages. Set the marker directly (rolling-tail is now
+        # handled by top-level cache_control, not per-message markers).
+        messages = [
             {"role": "system", "content": "System prompt"},
-            {"role": "assistant", "content": "Hello from assistant"},
-        ])
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Hello from assistant", "cache_control": {"type": "ephemeral"}}
+                ],
+            },
+        ]
 
         _, result = convert_messages_to_anthropic(messages)
         assistant_blocks = result[0]["content"]
@@ -807,7 +815,10 @@ class TestConvertMessages:
         assert assistant_blocks[0]["cache_control"] == {"type": "ephemeral"}
 
     def test_tool_cache_control_is_preserved_on_tool_result_block(self):
-        messages = apply_anthropic_cache_control([
+        # Verify convert_messages_to_anthropic preserves cache_control markers
+        # on tool messages. Set the marker directly (rolling-tail is now
+        # handled by top-level cache_control, not per-message markers).
+        messages = [
             {"role": "system", "content": "System prompt"},
             {
                 "role": "assistant",
@@ -816,8 +827,8 @@ class TestConvertMessages:
                     {"id": "tc_1", "function": {"name": "test_tool", "arguments": "{}"}},
                 ],
             },
-            {"role": "tool", "tool_call_id": "tc_1", "content": "result"},
-        ], native_anthropic=True)
+            {"role": "tool", "tool_call_id": "tc_1", "content": "result", "cache_control": {"type": "ephemeral"}},
+        ]
 
         _, result = convert_messages_to_anthropic(messages)
         user_msg = [m for m in result if m["role"] == "user"][0]

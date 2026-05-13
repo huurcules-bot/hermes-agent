@@ -159,7 +159,7 @@ from agent.model_metadata import (
 )
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
-from agent.prompt_caching import apply_anthropic_cache_control, apply_anthropic_tools_cache_control
+from agent.prompt_caching import apply_anthropic_cache_control, apply_anthropic_tools_cache_control, apply_request_level_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.codex_responses_adapter import (
@@ -1436,16 +1436,16 @@ class AIAgent:
         self._use_prompt_caching, self._use_native_cache_layout = (
             self._anthropic_prompt_cache_policy()
         )
-        # Anthropic supports "5m" (default) and "1h" cache TTL tiers. Read from
-        # config.yaml under prompt_caching.cache_ttl; unknown values keep "5m".
-        # 1h tier costs 2x on write vs 1.25x for 5m, but amortizes across long
-        # sessions with >5-minute pauses between turns (#14971).
-        self._cache_ttl = "5m"
+        # Default: 1h for main sessions (no parent) — amortizes across long
+        # sessions with >5-minute pauses. 5m for leaf subagents (rapid
+        # tool-call loops, short-lived). Config override always wins.
+        _is_child = parent_session_id is not None and parent_session_id != ""
+        self._cache_ttl = "5m" if _is_child else "1h"
         try:
             from hermes_cli.config import load_config as _load_pc_cfg
 
             _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
-            _ttl = _pc_cfg.get("cache_ttl", "5m")
+            _ttl = _pc_cfg.get("cache_ttl", "")
             if _ttl in ("5m", "1h"):
                 self._cache_ttl = _ttl
         except Exception:
@@ -11964,12 +11964,20 @@ class AIAgent:
                         # Apply message-level cache markers AFTER kwargs are
                         # built so the function sees the final shape of
                         # ``messages`` (post-relocation) and can mark every
-                        # ``<system-reminder>`` plus the rolling-tail message.
+                        # ``<system-reminder>`` (up to 2 blocks).
                         if api_kwargs.get("messages"):
                             api_kwargs["messages"] = apply_anthropic_cache_control(
                                 api_kwargs["messages"],
                                 cache_ttl=self._cache_ttl,
                                 native_anthropic=self._use_native_cache_layout,
+                            )
+                        # Top-level automatic caching: places a rolling breakpoint on the
+                        # last cacheable block without burning an explicit slot. Only on
+                        # native Anthropic layout — OpenRouter uses OpenAI wire format.
+                        if self._use_native_cache_layout:
+                            apply_request_level_cache_control(
+                                api_kwargs,
+                                cache_ttl=self._cache_ttl,
                             )
                     if self.api_mode == "codex_responses":
                         api_kwargs = self._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
@@ -12065,7 +12073,7 @@ class AIAgent:
                         # Log response with provider info if available
                         resp_model = getattr(response, 'model', 'N/A') if response else 'N/A'
                         logging.debug(f"API Response received - Model: {resp_model}, Usage: {response.usage if hasattr(response, 'usage') else 'N/A'}")
-                    logger.debug("[%s] msg #%d response.usage raw: %s", self.session_id, self.session_api_calls + 1, getattr(response, "usage", None))
+                    logger.info("[%s] msg #%d response.usage raw: %s", self.session_id, self.session_api_calls + 1, getattr(response, "usage", None))
                     
                     # Validate response shape before proceeding
                     response_invalid = False

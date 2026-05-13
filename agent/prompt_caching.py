@@ -5,10 +5,15 @@ breakpoints at stable cut-points in the request. Anthropic allows up to 4
 breakpoints; this module places message-level ones. Tools-list breakpoint
 lives in ``apply_anthropic_tools_cache_control``.
 
-``apply_anthropic_cache_control`` marks two kinds of messages:
-  - every text content block that starts with ``<system-reminder>``
-    (each system-reminder block gets its own breakpoint)
-  - the very last message in ``messages`` (rolling tail)
+``apply_anthropic_cache_control`` marks two kinds of content blocks:
+  - up to the last 2 text content blocks that start with ``<system-reminder>``
+    (gated to 2 to stay within the 4-breakpoint limit)
+  - (rolling tail is now handled automatically via top-level cache_control
+    set by ``apply_request_level_cache_control`` — no explicit last-message
+    marker is placed here)
+
+Breakpoint budget: 1 (tools) + up to 2 (system-reminders) + 1 (automatic
+rolling tail from top-level cache_control) = 4 max.
 
 Pure functions -- no class state, no AIAgent dependency.
 """
@@ -51,12 +56,19 @@ def apply_anthropic_cache_control(
     cache_ttl: str = "5m",
     native_anthropic: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Mark cache breakpoints on ``<system-reminder>`` content blocks and the last message.
+    """Mark cache breakpoints on up to the last 2 ``<system-reminder>`` content blocks.
 
-    For each message, iterates every content block and adds ``cache_control``
-    to each text block whose text starts with ``<system-reminder>``. Plain
-    string content is converted to a block first. Also marks the final message
-    as a rolling-tail breakpoint.
+    For each message, iterates every content block and collects references to
+    text blocks whose text starts with ``<system-reminder>``. Then marks only
+    the last 2 such blocks (to stay within the 4-breakpoint budget: 1 tools +
+    2 system-reminders + 1 automatic rolling tail).
+
+    Plain string content that starts with ``<system-reminder>`` is converted
+    to a block first during the marking step.
+
+    Note: The rolling-tail (last message) breakpoint is NO LONGER placed here.
+    Use ``apply_request_level_cache_control`` to set a top-level cache_control
+    on the API kwargs instead — the API handles rolling-tail automatically.
 
     Returns:
         Deep copy of messages with cache_control breakpoints injected.
@@ -69,11 +81,17 @@ def apply_anthropic_cache_control(
     if cache_ttl == "1h":
         marker["ttl"] = "1h"
 
+    # First pass: collect all system-reminder block references.
+    # Each entry is a dict block (already in list-content form).
+    # For string content we handle during the marking pass below.
+    reminder_blocks: List[Dict[str, Any]] = []
+    string_reminder_msgs: List[Dict[str, Any]] = []
+
     for msg in messages:
         content = msg.get("content")
         if isinstance(content, str):
             if content.startswith(_SYSTEM_REMINDER_PREFIX):
-                _apply_cache_marker(msg, marker, native_anthropic=native_anthropic)
+                string_reminder_msgs.append(msg)
         elif isinstance(content, list):
             for block in content:
                 if (
@@ -82,11 +100,61 @@ def apply_anthropic_cache_control(
                     and isinstance(block.get("text"), str)
                     and block["text"].startswith(_SYSTEM_REMINDER_PREFIX)
                 ):
-                    block["cache_control"] = marker
+                    reminder_blocks.append(block)
 
-    _apply_cache_marker(messages[-1], marker, native_anthropic=native_anthropic)
+    # Combine: string-content reminders count as one block each.
+    # We need to gate the total to 2. Process in order: string reminders
+    # come from earlier passes; for simplicity, count all reminders together.
+    total_reminders = len(string_reminder_msgs) + len(reminder_blocks)
+    # Keep only the last 2 from the combined list (in document order,
+    # string_reminder_msgs appear interleaved; we approximate by taking
+    # last 2 from each category proportionally — but since bypass module
+    # creates list-content blocks, the common case is all in reminder_blocks).
+    # Simple approach: mark last 2 overall. String-content reminders are
+    # rare so we process list-content blocks first (they appear in order).
+    skip_count = max(0, total_reminders - 2)
+
+    skipped = 0
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, str):
+            if content.startswith(_SYSTEM_REMINDER_PREFIX):
+                if skipped < skip_count:
+                    skipped += 1
+                else:
+                    _apply_cache_marker(msg, marker, native_anthropic=native_anthropic)
+        elif isinstance(content, list):
+            for block in content:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and isinstance(block.get("text"), str)
+                    and block["text"].startswith(_SYSTEM_REMINDER_PREFIX)
+                ):
+                    if skipped < skip_count:
+                        skipped += 1
+                    else:
+                        block["cache_control"] = marker
 
     return messages
+
+
+def apply_request_level_cache_control(
+    api_kwargs: Dict[str, Any],
+    cache_ttl: str = "5m",
+) -> None:
+    """Add top-level cache_control to an Anthropic API request.
+
+    This enables automatic caching: the API places a cache breakpoint on
+    the last cacheable block and moves it forward as conversations grow.
+    Combined with explicit breakpoints on tools and system-reminders,
+    this provides optimal caching without wasting a slot on a rolling-tail
+    message marker.
+    """
+    marker: Dict[str, Any] = {"type": "ephemeral"}
+    if cache_ttl == "1h":
+        marker["ttl"] = "1h"
+    api_kwargs["cache_control"] = marker
 
 
 def apply_anthropic_tools_cache_control(

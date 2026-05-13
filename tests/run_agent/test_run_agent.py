@@ -686,7 +686,7 @@ class TestInit:
             assert a._use_prompt_caching is True
 
     def test_prompt_caching_cache_ttl_defaults_without_config(self):
-        """cache_ttl stays 5m when prompt_caching is absent from config."""
+        """cache_ttl defaults to 1h for a main session when prompt_caching is absent from config."""
         with (
             patch("run_agent.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
@@ -701,7 +701,7 @@ class TestInit:
                 skip_context_files=True,
                 skip_memory=True,
             )
-            assert a._cache_ttl == "5m"
+            assert a._cache_ttl == "1h"
 
     def test_prompt_caching_cache_ttl_custom_1h(self):
         """prompt_caching.cache_ttl 1h is applied when present in config."""
@@ -775,7 +775,7 @@ class TestInit:
         assert a.max_tokens == 8192
 
     def test_prompt_caching_cache_ttl_invalid_falls_back(self):
-        """Non-Anthropic TTL values keep default 5m without raising."""
+        """Non-Anthropic TTL values fall back to the main-session default (1h) without raising."""
         with (
             patch("run_agent.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
@@ -783,6 +783,27 @@ class TestInit:
             patch(
                 "hermes_cli.config.load_config",
                 return_value={"prompt_caching": {"cache_ttl": "30m"}},
+            ),
+        ):
+            a = AIAgent(
+                api_key="test-k...7890",
+                model="anthropic/claude-sonnet-4-20250514",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            assert a._cache_ttl == "1h"
+
+    def test_cache_ttl_config_override_5m(self):
+        """Config cache_ttl=5m overrides the 1h default for a main session."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"prompt_caching": {"cache_ttl": "5m"}},
             ),
         ):
             a = AIAgent(

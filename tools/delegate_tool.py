@@ -1120,6 +1120,11 @@ def _build_child_agent(
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role
+    # Leaf subagents are short-lived rapid tool-call loops — 5m TTL is
+    # sufficient and cheaper on cache writes.  Orchestrators and main sessions
+    # stay at 1h (set in AIAgent.__init__) to survive long pauses.
+    if effective_role == "leaf":
+        child._cache_ttl = "5m"
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id

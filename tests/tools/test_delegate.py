@@ -405,6 +405,49 @@ class TestToolNamePreservation(unittest.TestCase):
         self.assertEqual(captured["saved"], expected_tools)
 
 
+class TestChildCacheTTL(unittest.TestCase):
+    """_build_child_agent sets _cache_ttl based on effective role."""
+
+    def _make_built_child(self, role, mock_agent_cls):
+        """Call _build_child_agent with the given role and return the child mock."""
+        parent = _make_mock_parent(depth=0)
+        mock_agent_cls.return_value._delegate_depth = 0
+        mock_agent_cls.return_value._cache_ttl = "1h"  # default set by __init__
+        _build_child_agent(
+            task_index=0,
+            goal="test goal",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=10,
+            parent_agent=parent,
+            task_count=1,
+            role=role,
+        )
+        return mock_agent_cls.return_value
+
+    @patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True)
+    @patch("tools.delegate_tool._get_max_spawn_depth", return_value=2)
+    @patch("run_agent.AIAgent")
+    def test_leaf_child_gets_5m_ttl(self, mock_agent_cls, *_):
+        """Leaf subagents are set to 5m immediately after construction."""
+        child = self._make_built_child("leaf", mock_agent_cls)
+        assert child._cache_ttl == "5m", (
+            f"Leaf child expected _cache_ttl='5m', got {child._cache_ttl!r}"
+        )
+
+    @patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True)
+    @patch("tools.delegate_tool._get_max_spawn_depth", return_value=2)
+    @patch("run_agent.AIAgent")
+    def test_orchestrator_child_keeps_1h_ttl(self, mock_agent_cls, *_):
+        """Orchestrator subagents keep the 1h default from __init__."""
+        child = self._make_built_child("orchestrator", mock_agent_cls)
+        # _cache_ttl should NOT have been overwritten to "5m"
+        assert child._cache_ttl == "1h", (
+            f"Orchestrator child expected _cache_ttl='1h', got {child._cache_ttl!r}"
+        )
+
+
 class TestDelegateObservability(unittest.TestCase):
     """Tests for enriched metadata returned by _run_single_child."""
 

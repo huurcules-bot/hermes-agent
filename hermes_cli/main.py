@@ -5934,6 +5934,24 @@ def _kill_stale_dashboard_processes(
 _warn_stale_dashboard_processes = _kill_stale_dashboard_processes
 
 
+def _fetch_latest_release_tag() -> Optional[str]:
+    """Return the latest release tag from the GitHub API, or None on failure."""
+    import urllib.request
+    import urllib.error
+
+    api_url = "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest"
+    try:
+        req = urllib.request.Request(
+            api_url, headers={"Accept": "application/vnd.github+json"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        tag = data.get("tag_name", "").strip()
+        return tag or None
+    except Exception:
+        return None
+
+
 def _update_via_zip(args):
     """Update Hermes Agent by downloading a ZIP archive.
 
@@ -5944,15 +5962,22 @@ def _update_via_zip(args):
     import zipfile
     from urllib.request import urlretrieve
 
-    branch = "main"
-    zip_url = (
-        f"https://github.com/NousResearch/hermes-agent/archive/refs/heads/{branch}.zip"
-    )
+    tag = _fetch_latest_release_tag()
+    if tag:
+        zip_url = (
+            f"https://github.com/NousResearch/hermes-agent/archive/refs/tags/{tag}.zip"
+        )
+        zip_label = tag
+        print(f"→ Downloading latest release ({tag})...")
+    else:
+        # Fallback: HEAD of main branch when the releases API is unreachable
+        zip_url = "https://github.com/NousResearch/hermes-agent/archive/refs/heads/main.zip"
+        zip_label = "main"
+        print("→ Downloading latest version (could not resolve release tag, using main)...")
 
-    print("→ Downloading latest version...")
     try:
         tmp_dir = tempfile.mkdtemp(prefix="hermes-update-")
-        zip_path = os.path.join(tmp_dir, f"hermes-agent-{branch}.zip")
+        zip_path = os.path.join(tmp_dir, f"hermes-agent-{zip_label}.zip")
         urlretrieve(zip_url, zip_path)
 
         print("→ Extracting...")
@@ -5970,8 +5995,8 @@ def _update_via_zip(args):
                     )
             zf.extractall(tmp_dir)
 
-        # GitHub ZIPs extract to hermes-agent-<branch>/
-        extracted = os.path.join(tmp_dir, f"hermes-agent-{branch}")
+        # GitHub ZIPs extract to hermes-agent-<label>/
+        extracted = os.path.join(tmp_dir, f"hermes-agent-{zip_label}")
         if not os.path.isdir(extracted):
             # Try to find it
             for d in os.listdir(tmp_dir):
@@ -7228,10 +7253,10 @@ def _cmd_update_check():
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
 
-    # Fetch both origin and upstream; prefer upstream as the canonical reference
+    # Fetch tags from upstream (preferred) or origin
     print("→ Fetching from upstream...")
     fetch_result = subprocess.run(
-        git_cmd + ["fetch", "upstream"],
+        git_cmd + ["fetch", "upstream", "--tags"],
         cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
@@ -7240,16 +7265,14 @@ def _cmd_update_check():
         # Fallback to origin if upstream doesn't exist
         print("→ Fetching from origin...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin"],
+            git_cmd + ["fetch", "origin", "--tags"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
         )
         upstream_exists = False
-        compare_branch = "origin/main"
     else:
         upstream_exists = True
-        compare_branch = "upstream/main"
 
     if fetch_result.returncode != 0:
         stderr = fetch_result.stderr.strip()
@@ -7263,8 +7286,31 @@ def _cmd_update_check():
                 print(f"  {stderr.splitlines()[0]}")
         sys.exit(1)
 
+    # Resolve the latest tag
+    try:
+        tag_result = subprocess.run(
+            git_cmd + ["tag", "--sort=-version:refname"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        tags = [t.strip() for t in tag_result.stdout.splitlines() if t.strip()]
+        latest_tag = tags[0] if tags else None
+    except Exception:
+        latest_tag = None
+
+    if latest_tag:
+        compare_ref = latest_tag
+        print(f"→ Latest release tag: {latest_tag}")
+    elif upstream_exists:
+        compare_ref = "upstream/main"
+        print("  ⚠ No release tags found — comparing against upstream/main")
+    else:
+        compare_ref = "origin/main"
+        print("  ⚠ No release tags found — comparing against origin/main")
+
     rev_result = subprocess.run(
-        git_cmd + ["rev-list", f"HEAD..{compare_branch}", "--count"],
+        git_cmd + ["rev-list", f"HEAD..{compare_ref}", "--count"],
         cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
@@ -7276,7 +7322,7 @@ def _cmd_update_check():
         print("✓ Already up to date.")
     else:
         commits_word = "commit" if behind == 1 else "commits"
-        print(f"⚕ Update available: {behind} {commits_word} behind {compare_branch}.")
+        print(f"⚕ Update available: {behind} {commits_word} behind {compare_ref}.")
         from hermes_cli.config import recommended_update_command
 
         print(f"  Run '{recommended_update_command()}' to install.")
@@ -7597,6 +7643,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print(f"  {stderr.splitlines()[0]}")
             sys.exit(1)
 
+        # Fetch tags so we can resolve the latest release
+        subprocess.run(
+            git_cmd + ["fetch", "origin", "--tags"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+
         # Get current branch (returns literal "HEAD" when detached)
         result = subprocess.run(
             git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
@@ -7607,10 +7661,33 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
         current_branch = result.stdout.strip()
 
-        # Always update against main
-        branch = "main"
+        # Resolve the latest release tag.  Prefer GitHub API so we always get
+        # the canonical release even if the local tag list is stale or sparse.
+        # Fall back to the newest semver tag in the local fetch.
+        release_tag = _fetch_latest_release_tag()
+        if not release_tag:
+            try:
+                tag_result = subprocess.run(
+                    git_cmd + ["tag", "--sort=-version:refname"],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                tags = [t.strip() for t in tag_result.stdout.splitlines() if t.strip()]
+                release_tag = tags[0] if tags else None
+            except Exception:
+                release_tag = None
+
+        if release_tag:
+            print(f"→ Target release: {release_tag}")
+            target_ref = release_tag
+        else:
+            # Last resort: fall back to origin/main if no tags exist
+            print("  ⚠ No release tags found — falling back to origin/main")
+            target_ref = "origin/main"
 
         # If user is on a non-main branch or detached HEAD, switch to main
+        # first so the reset below lands cleanly on a known base.
         if current_branch != "main":
             label = (
                 "detached HEAD"
@@ -7638,7 +7715,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         # Check if there are updates
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{target_ref}", "--count"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -7686,36 +7763,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Never let a snapshot failure block an update.
             logger.debug("Pre-update snapshot failed: %s", exc)
 
-        print("→ Pulling updates...")
+        print("→ Updating to latest release...")
         update_succeeded = False
         try:
-            pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
+            reset_result = subprocess.run(
+                git_cmd + ["reset", "--hard", target_ref],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
             )
-            if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
+            if reset_result.returncode != 0:
+                print(f"✗ Failed to reset to {target_ref}.")
+                if reset_result.stderr.strip():
+                    print(f"  {reset_result.stderr.strip()}")
                 print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                    f"  Try manually: git fetch origin --tags && git reset --hard {target_ref}"
                 )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                    cwd=PROJECT_ROOT,
-                    capture_output=True,
-                    text=True,
-                )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
-                    print(
-                        "  Try manually: git fetch origin && git reset --hard origin/main"
-                    )
-                    sys.exit(1)
+                sys.exit(1)
             update_succeeded = True
         finally:
             if auto_stash_ref is not None:

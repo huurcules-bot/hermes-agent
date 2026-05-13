@@ -1703,10 +1703,13 @@ def _format_process_notification(evt: dict) -> "tuple[str, bool] | None":
     # apply_job.py fill completions and cdp_form_tools/greenhouse read commands
     # carry the full form viewer — print verbatim so Charlotte sees the Q:/A:
     # output in the terminal without agent relay or truncation.
+    # present_jobs.py output is also printed verbatim so Charlotte sees the
+    # full job report without truncation or agent reformatting.
     verbatim = (
         "apply_job.py fill" in _cmd
         or "cdp_form_tools.py" in _cmd and "read" in _cmd
         or "greenhouse.py" in _cmd and "read" in _cmd
+        or "present_jobs.py" in _cmd
     )
     return (message, verbatim)
 
